@@ -7,13 +7,32 @@ Agent 抽象基类
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from orchestrator.schemas import SubTask, AgentResult
 
 
-__all__ = ["BaseAgent"]
+__all__ = ["AgentHealth", "AgentMetrics", "BaseAgent"]
+
+
+@dataclass
+class AgentHealth:
+    """Reusable agent health state tracked by AgentPool."""
+
+    degraded: bool = False
+    last_error: str | None = None
+    failure_count: int = 0
+
+
+@dataclass
+class AgentMetrics:
+    """Lightweight cumulative metrics for pooled agents."""
+
+    runs: int = 0
+    total_tokens: int = 0
+    tool_calls: int = 0
 
 
 class BaseAgent(ABC):
@@ -38,6 +57,27 @@ class BaseAgent(ABC):
         self.policy = policy
         self.tools = tools or []
         self.pool_type_key = pool_type_key
+        self.health = AgentHealth()
+        self.metrics = AgentMetrics()
+
+    def record_result(self, result: "AgentResult") -> None:
+        """Update reusable agent health/metrics after one run."""
+        self.metrics.runs += 1
+        self.metrics.total_tokens += getattr(result, "token_usage", 0) or 0
+        self.metrics.tool_calls += sum(
+            1 for step in getattr(result, "trajectory", [])
+            if isinstance(step, dict) and step.get("role") == "tool"
+        )
+        if getattr(result, "status", None) and result.status.value != "success":
+            self.health.failure_count += 1
+            self.health.last_error = str(getattr(result, "output", ""))[:300]
+        else:
+            self.health.last_error = None
+
+    def finalize_result(self, result: "AgentResult") -> "AgentResult":
+        """Record metrics and return result for concise Agent.run implementations."""
+        self.record_result(result)
+        return result
 
     @abstractmethod
     async def run(self, task: "SubTask", context: dict) -> "AgentResult":

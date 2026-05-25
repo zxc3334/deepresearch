@@ -161,6 +161,12 @@ def initialize_modules(config: dict, session_id: str = "") -> dict[str, Any]:
         kwargs.update(module_overrides)
         return kwargs
 
+    def _create_policy(module_name: str, use_cache: bool = True):
+        """Create a policy for one module using mapping + sampling config."""
+        backend_name = backend_mapping.get(module_name, default_backend)
+        kwargs = _get_sampling_kwargs(module_name, backend_name)
+        return ModelRouter.create_backend(backend_name, use_cache=use_cache, **kwargs)
+
     # 默认后端（所有模块共用）
     default_kwargs = _get_sampling_kwargs("default", default_backend)
     default_policy = ModelRouter.create_backend(default_backend, **default_kwargs)
@@ -247,11 +253,11 @@ def initialize_modules(config: dict, session_id: str = "") -> dict[str, Any]:
     from src.orchestrator.agent_pool import AgentPool
 
     agent_pool = AgentPool(
-        policy_factory=lambda: modules.get("solver_policy", default_policy),
+        policy_factory=lambda: _create_policy("solver", use_cache=False),
         tools_factory=lambda: list(modules["tools"]),
         max_idle=3,
         policy_factory_by_type={
-            "synthesis": lambda: modules.get("summarizer_policy", default_policy),
+            "synthesis": lambda: _create_policy("summarizer", use_cache=False),
         },
     )
     modules["agent_pool"] = agent_pool

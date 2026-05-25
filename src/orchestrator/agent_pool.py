@@ -75,7 +75,7 @@ class AgentPool:
         while self._idle[type_key]:
             agent = self._idle[type_key].pop()
             # 简单健康检查：若 Agent 内部 policy 被标记为截断/污染，则丢弃
-            if hasattr(agent, "policy") and getattr(agent.policy, "was_truncated", False):
+            if self._is_degraded(agent):
                 self._degraded_count[type_key] += 1
                 continue  # 丢弃，尝试下一个
             self._active_count[type_key] += 1
@@ -101,7 +101,7 @@ class AgentPool:
         self._active_count[type_key] = max(0, self._active_count.get(type_key, 0) - 1)
 
         # 健康检查
-        if hasattr(agent, "policy") and getattr(agent.policy, "was_truncated", False):
+        if self._is_degraded(agent):
             self._degraded_count[type_key] = self._degraded_count.get(type_key, 0) + 1
             return  # 不回收
 
@@ -156,6 +156,13 @@ class AgentPool:
         else:
             # 默认降级为 Researcher
             return ResearcherAgent(name=f"researcher_default", policy=policy, tools=tools, pool_type_key=type_key)
+
+    def _is_degraded(self, agent: "BaseAgent") -> bool:
+        """Return whether a pooled agent should be discarded instead of reused."""
+        if hasattr(agent, "policy") and getattr(agent.policy, "was_truncated", False):
+            return True
+        health = getattr(agent, "health", None)
+        return bool(getattr(health, "degraded", False))
 
     def _infer_type_key(self, agent: "BaseAgent") -> str:
         """从 Agent 实例推断其类型键。"""

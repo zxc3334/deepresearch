@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from typing import Any
@@ -54,14 +55,14 @@ class SummarizerAgent(BaseAgent):
                 content="No sub-task results available to synthesize.",
                 confidence=0.0,
             )
-            return AgentResult(
+            return self.finalize_result(AgentResult(
                 task_id=task.task_id,
                 status=AgentStatus.FAILED,
                 output=report,
                 trajectory=[],
                 token_usage=0,
                 confidence=0.0,
-            )
+            ))
 
         # 构建 synthesis prompt
         prompt = self._build_synthesis_prompt(query, results, domain=domain)
@@ -74,17 +75,27 @@ class SummarizerAgent(BaseAgent):
             # 合成任务不需要工具调用，临时禁用 tools 避免模型进入 tool-calling 模式
             old_tools = getattr(self.policy, "tools", None)
             self.policy.tools = None
-            response = self.policy(messages)
-            self.policy.tools = old_tools
+            response = await asyncio.to_thread(self.policy, messages)
         except RuntimeError as e:
-            return AgentResult(
+            return self.finalize_result(AgentResult(
                 task_id=task.task_id,
                 status=AgentStatus.FAILED,
                 output=str(e),
                 trajectory=[{"error": str(e)}],
                 token_usage=0,
                 confidence=0.0,
-            )
+            ))
+        except Exception as e:
+            return self.finalize_result(AgentResult(
+                task_id=task.task_id,
+                status=AgentStatus.FAILED,
+                output=f"Synthesis failed: {type(e).__name__}: {e}",
+                trajectory=[{"error": str(e)}],
+                token_usage=0,
+                confidence=0.0,
+            ))
+        finally:
+            self.policy.tools = old_tools
 
         content = response.get("content", "") or ""
         token_usage = len(content) // 3  # 简化估算
@@ -92,14 +103,14 @@ class SummarizerAgent(BaseAgent):
         # 解析报告内容，提取来源和置信度
         report = self._parse_report(query, content, results)
 
-        return AgentResult(
+        return self.finalize_result(AgentResult(
             task_id=task.task_id,
             status=AgentStatus.SUCCESS,
             output=report,
             trajectory=[{"role": "assistant", "content": content}],
             token_usage=token_usage,
             confidence=report.confidence,
-        )
+        ))
 
     def _system_prompt(self, domain: str = "general") -> str:
         if domain == "geo_remote_sensing":

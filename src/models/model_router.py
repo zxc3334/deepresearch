@@ -45,6 +45,7 @@ class ModelRouter:
     @staticmethod
     def create_backend(
         backend_name: str | None = None,
+        use_cache: bool = True,
         **override_kwargs,
     ) -> VLLMPolicy:
         """创建指定名称的 LLM Backend（返回 VLLMPolicy 实例）。
@@ -52,6 +53,8 @@ class ModelRouter:
         Args:
             backend_name: 后端名称，对应 .env 中的前缀。
                           为 None 时使用 DEFAULT_LLM_BACKEND。
+            use_cache: 是否复用同配置的 VLLMPolicy 实例。AgentPool 场景应传 False，
+                避免 tools / was_truncated 等 policy 内部状态跨 agent 共享。
             **override_kwargs: 覆盖 .env 中任何参数（如 temperature, max_tokens）。
 
         Returns:
@@ -64,10 +67,13 @@ class ModelRouter:
 
         name = (backend_name or get_env("DEFAULT_LLM_BACKEND", "vllm")).lower().strip()
 
-        # 检查缓存
-        cache_key = f"{name}:{hash(tuple(sorted(override_kwargs.items())))}"
-        if cache_key in _BACKEND_CACHE:
-            return _BACKEND_CACHE[cache_key]
+        # 检查缓存。仅在启用缓存时构造 key，避免 use_cache=False 场景被
+        # 未来可能出现的 unhashable override kwargs 影响。
+        cache_key = None
+        if use_cache:
+            cache_key = f"{name}:{hash(tuple(sorted(override_kwargs.items())))}"
+            if cache_key in _BACKEND_CACHE:
+                return _BACKEND_CACHE[cache_key]
 
         # 根据名称读取 .env 配置
         config = ModelRouter._load_backend_config(name)
@@ -75,7 +81,8 @@ class ModelRouter:
 
         # 创建 VLLMPolicy 实例
         policy = VLLMPolicy(**config)
-        _BACKEND_CACHE[cache_key] = policy
+        if use_cache and cache_key is not None:
+            _BACKEND_CACHE[cache_key] = policy
         return policy
 
     @staticmethod
