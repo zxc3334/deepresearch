@@ -1,9 +1,9 @@
-# GeoResearch Agent MVP config.
-# This config keeps the stable baseline runtime settings while enabling the
-# GIS / remote-sensing planner domain.
+# GeoResearch Agent config with real web search enabled.
+# Keep configs/geo_mvp.yaml as the stable mock demo; use this file when you
+# want evidence from live search APIs.
 
 system:
-  name: "GeoResearchAgent-MVP"
+  name: "GeoResearchAgent-RealSearch"
   version: "0.1.0"
   log_level: "INFO"
   work_dir: "./outputs"
@@ -43,7 +43,7 @@ model:
 
 orchestrator:
   max_concurrent: 2
-  global_timeout_seconds: 420
+  global_timeout_seconds: 600
   max_replan_rounds: 1
   max_sub_questions: 6
   max_subagent_retries: 1
@@ -81,7 +81,7 @@ compressor:
   enable_multilevel: true
 
 memory:
-  db_path: "data/geo_mvp_memory.db"
+  db_path: "data/geo_real_search_memory.db"
   max_entries: 1000
   similarity_threshold_dup: 0.92
   similarity_threshold_conflict: 0.65
@@ -101,7 +101,7 @@ evolution:
 tools:
   web_search:
     enabled: true
-    mock_mode: true
+    mock_mode: false
     max_results: 5
     snippet_max_tokens: 256
   arxiv_reader:

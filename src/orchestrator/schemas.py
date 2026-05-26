@@ -182,6 +182,7 @@ class ResearchReport:
         adversarial_rounds: 对抗验证轮数。
         final_score: 最终综合评分（由外部评测模块写入）。
         evidence_summary: evidence-aware summary grouped by level.
+        tool_trace: Compact tool-call observability summary.
     """
     query: str
     content: str
@@ -192,6 +193,7 @@ class ResearchReport:
     adversarial_rounds: int = 0
     final_score: float = 0.0
     evidence_summary: dict[str, Any] = field(default_factory=dict)
+    tool_trace: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass

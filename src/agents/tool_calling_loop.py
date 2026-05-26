@@ -22,6 +22,10 @@ class ToolLoopConfig:
 
     max_turns: int = 10
     max_tool_calls_before_summary: int = 2
+    context_budget_tokens: int = 12000
+    compact_threshold_ratio: float = 0.70
+    compact_tool_result_chars: int = 4000
+    chars_per_token: float = 3.5
 
 
 class ToolCallingLoop:
@@ -32,10 +36,12 @@ class ToolCallingLoop:
         policy,
         tool_registry: ToolRegistry,
         config: ToolLoopConfig | None = None,
+        trace_recorder=None,
     ) -> None:
         self.policy = policy
         self.tool_registry = tool_registry
         self.config = config or ToolLoopConfig()
+        self.trace_recorder = trace_recorder
         self.messages: list[dict] = []
         self.trajectory: list[dict] = []
         self.total_tokens: int = 0
@@ -81,15 +87,27 @@ class ToolCallingLoop:
 
             content = response.get("content", "") or ""
             tool_calls = response.get("tool_calls", []) or []
+            usage = response.get("usage", {}) or {}
 
             self.trajectory.append({
                 "turn": turn,
                 "role": "assistant",
                 "content": content,
                 "tool_calls": [dict(tc) for tc in tool_calls],
+                "usage": usage,
             })
+            if self.trace_recorder:
+                self.trace_recorder.record(
+                    "llm_call",
+                    task_id=task.task_id,
+                    turn=turn,
+                    role="researcher",
+                    usage=usage,
+                    tool_call_count=len(tool_calls),
+                    output_chars=len(content),
+                )
 
-            self.total_tokens += len(json.dumps(self.messages, ensure_ascii=False)) // 3
+            self.total_tokens += usage.get("total_tokens", 0) or len(json.dumps(self.messages, ensure_ascii=False)) // 3
 
             if not tool_calls:
                 if self._is_tool_failure_explanation(content):
@@ -137,9 +155,26 @@ class ToolCallingLoop:
                 args = {}
 
             result = await self.tool_registry.execute(tool_name, args)
+            if self.trace_recorder:
+                self.trace_recorder.record(
+                    "tool_call",
+                    task_id=task.task_id,
+                    turn=turn,
+                    tool=tool_name,
+                    args=args,
+                )
 
             if isinstance(result, dict) and result.get("error"):
                 error_msg = result["error"]
+                if self.trace_recorder:
+                    self.trace_recorder.record(
+                        "tool_result",
+                        task_id=task.task_id,
+                        turn=turn,
+                        tool=tool_name,
+                        status="error",
+                        error=error_msg,
+                    )
                 self.trajectory.append({
                     "turn": turn,
                     "role": "tool",
@@ -161,6 +196,8 @@ class ToolCallingLoop:
                 "name": tool_name,
                 "result": result,
             }
+            self._log_tool_result(task, turn, tool_name, args, result)
+            self._trace_tool_result(task, turn, tool_name, result)
             tool_results.append(tool_result)
             self.trajectory.append({
                 "turn": turn,
@@ -171,6 +208,55 @@ class ToolCallingLoop:
             })
 
         return tool_results
+
+    def _trace_tool_result(self, task: SubTask, turn: int, tool_name: str, result) -> None:
+        if not self.trace_recorder:
+            return
+        if not isinstance(result, dict):
+            self.trace_recorder.record(
+                "tool_result",
+                task_id=task.task_id,
+                turn=turn,
+                tool=tool_name,
+                status="success",
+                result_type=type(result).__name__,
+            )
+            return
+
+        urls = []
+        for item in result.get("results", []) or []:
+            if isinstance(item, dict) and item.get("url"):
+                urls.append(item["url"])
+        self.trace_recorder.record(
+            "tool_result",
+            task_id=task.task_id,
+            turn=turn,
+            tool=tool_name,
+            status="success",
+            source=result.get("source", ""),
+            total=result.get("total"),
+            url_count=len(urls),
+            urls=urls[:10],
+        )
+
+    def _log_tool_result(self, task: SubTask, turn: int, tool_name: str, args: dict, result) -> None:
+        """Print compact tool observability for logs and demo debugging."""
+        if not isinstance(result, dict):
+            print(f"[ToolCall] task={task.task_id} turn={turn} tool={tool_name} args={args} result_type={type(result).__name__}")
+            return
+
+        urls = []
+        for item in result.get("results", []) or []:
+            if isinstance(item, dict) and item.get("url"):
+                urls.append(str(item["url"]))
+        if result.get("error"):
+            print(f"[ToolCall] task={task.task_id} turn={turn} tool={tool_name} args={args} error={result['error']}")
+            return
+        url_preview = ", ".join(urls[:3]) if urls else "no-url"
+        print(
+            f"[ToolCall] task={task.task_id} turn={turn} tool={tool_name} "
+            f"total={result.get('total', 'n/a')} source={result.get('source', '')} urls={url_preview}"
+        )
 
     def _append_assistant_and_tool_messages(
         self,
@@ -192,6 +278,7 @@ class ToolCallingLoop:
 
         for tr in tool_results:
             msg_content = json.dumps(tr["result"], ensure_ascii=False, default=str)
+            msg_content = self._maybe_compact_tool_content(msg_content, tr["name"])
             if force_summary:
                 msg_content += "\n\n[SYSTEM NOTICE] You have already searched enough. Write your final summary NOW. Do NOT call any more tools."
             self.messages.append({
@@ -199,6 +286,76 @@ class ToolCallingLoop:
                 "tool_call_id": tr["tool_call_id"],
                 "content": msg_content,
             })
+
+    def _maybe_compact_tool_content(self, content: str, tool_name: str) -> str:
+        """Compact tool result only when projected context exceeds the threshold.
+
+        Error text is never compacted; preserving failure details is more important
+        than saving context.
+        """
+        if self._looks_like_error_content(content):
+            return content
+
+        projected_chars = self._messages_chars(self.messages) + len(content)
+        threshold_chars = int(
+            self.config.context_budget_tokens
+            * self.config.chars_per_token
+            * self.config.compact_threshold_ratio
+        )
+        if projected_chars <= threshold_chars:
+            return content
+        if len(content) <= self.config.compact_tool_result_chars:
+            return content
+
+        compacted = self._head_tail_compact(content, self.config.compact_tool_result_chars)
+        print(
+            f"[compact] tool={tool_name} chars={len(content)}->{len(compacted)} "
+            f"projected={projected_chars}/{threshold_chars}"
+        )
+        if self.trace_recorder:
+            self.trace_recorder.record(
+                "compact",
+                scope="tool_result",
+                tool=tool_name,
+                before_chars=len(content),
+                after_chars=len(compacted),
+                threshold_chars=threshold_chars,
+                strategy="head_tail_70_30",
+            )
+        return compacted
+
+    def _messages_chars(self, messages: list[dict]) -> int:
+        total = 0
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            total += len(str(message.get("content", "")))
+            if message.get("tool_calls"):
+                total += len(json.dumps(message.get("tool_calls"), ensure_ascii=False, default=str))
+        return total
+
+    def _head_tail_compact(self, text: str, max_chars: int, head_ratio: float = 0.70) -> str:
+        head_chars = max(1, int(max_chars * head_ratio))
+        tail_chars = max(1, max_chars - head_chars)
+        omitted = max(0, len(text) - head_chars - tail_chars)
+        return (
+            f"{text[:head_chars].rstrip()}\n"
+            f"[compact] omitted {omitted} chars from middle of tool result; preserved head/tail 70/30.\n"
+            f"{text[-tail_chars:].lstrip()}"
+        )
+
+    def _looks_like_error_content(self, content: str) -> bool:
+        text = (content or "").lower()
+        return any(marker in text for marker in (
+            '"error"',
+            "error:",
+            "failed",
+            "traceback",
+            "exception",
+            "connection error",
+            "request timed out",
+            "api key",
+        ))
 
     def _maybe_force_tool_use(self, turn: int, fallback_tool: str) -> None:
         if turn > 0 and self.messages and self.messages[-1].get("role") == "assistant":
@@ -249,6 +406,8 @@ class ToolCallingLoop:
             "cannot search", "unable to search", "quota exceeded",
             "api key", "额度不足", "余额不足", "余额为", "余额：0",
             "网络错误", "连接失败", "无法连接到",
+            "error: connection error", "error: request timed out",
+            "connection error", "request timed out",
         ]
         return any(kw in c for kw in failure_keywords)
 

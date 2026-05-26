@@ -38,11 +38,15 @@ class AgentPool:
         tools_factory=None,
         max_idle: int = 3,
         policy_factory_by_type: dict[str, Callable] | None = None,
+        agent_config: dict | None = None,
+        trace_recorder=None,
     ) -> None:
         self.policy_factory = policy_factory
         self.tools_factory = tools_factory
         self.max_idle = max(max_idle, 1)
         self.policy_factory_by_type = policy_factory_by_type or {}
+        self.agent_config = agent_config or {}
+        self.trace_recorder = trace_recorder
 
         # 类型 -> 空闲 Agent 列表
         self._idle: dict[str, list[BaseAgent]] = {}
@@ -135,27 +139,59 @@ class AgentPool:
         # 延迟导入避免循环依赖
         from ..agents.researcher import ResearcherAgent
         from ..agents.summarizer import SummarizerAgent
+        from ..agents.tool_calling_loop import ToolLoopConfig
         from .schemas import TaskType
 
+        researcher_cfg = self.agent_config.get("researcher", {})
+        loop_cfg = researcher_cfg.get("tool_loop", {})
+        tool_loop_config = ToolLoopConfig(
+            max_turns=loop_cfg.get("max_turns", researcher_cfg.get("max_turns", 10)),
+            max_tool_calls_before_summary=loop_cfg.get("max_tool_calls_before_summary", 2),
+            context_budget_tokens=loop_cfg.get("context_budget_tokens", 12000),
+            compact_threshold_ratio=loop_cfg.get("compact_threshold_ratio", 0.70),
+            compact_tool_result_chars=loop_cfg.get("compact_tool_result_chars", 4000),
+            chars_per_token=loop_cfg.get("chars_per_token", 3.5),
+        )
+        summarizer_cfg = self.agent_config.get("summarizer", {})
+        summarizer_compact_cfg = summarizer_cfg.get("compact", {})
+
+        def make_researcher(name: str) -> ResearcherAgent:
+            return ResearcherAgent(
+                name=name,
+                policy=policy,
+                tools=tools,
+                max_turns=tool_loop_config.max_turns,
+                pool_type_key=type_key,
+                loop_config=tool_loop_config,
+                trace_recorder=self.trace_recorder,
+            )
+
         if type_key == TaskType.SEARCH.value:
-            return ResearcherAgent(name=f"researcher_{type_key}", policy=policy, tools=tools, pool_type_key=type_key)
+            return make_researcher(f"researcher_{type_key}")
         elif type_key == TaskType.ANALYZE.value:
-            return ResearcherAgent(name=f"analyzer_{type_key}", policy=policy, tools=tools, pool_type_key=type_key)
+            return make_researcher(f"analyzer_{type_key}")
         elif type_key == TaskType.VERIFY.value:
-            return ResearcherAgent(name=f"verifier_{type_key}", policy=policy, tools=tools, pool_type_key=type_key)
+            return make_researcher(f"verifier_{type_key}")
         elif type_key == TaskType.LITERATURE.value:
-            return ResearcherAgent(name=f"literature_{type_key}", policy=policy, tools=tools, pool_type_key=type_key)
+            return make_researcher(f"literature_{type_key}")
         elif type_key == TaskType.DATA_DISCOVERY.value:
-            return ResearcherAgent(name=f"data_discovery_{type_key}", policy=policy, tools=tools, pool_type_key=type_key)
+            return make_researcher(f"data_discovery_{type_key}")
         elif type_key == TaskType.METHOD_DESIGN.value:
-            return ResearcherAgent(name=f"method_design_{type_key}", policy=policy, tools=tools, pool_type_key=type_key)
+            return make_researcher(f"method_design_{type_key}")
         elif type_key == TaskType.GEO_VALIDATION.value:
-            return ResearcherAgent(name=f"geo_validation_{type_key}", policy=policy, tools=tools, pool_type_key=type_key)
+            return make_researcher(f"geo_validation_{type_key}")
         elif type_key in (TaskType.SYNTHESIS.value, "synthesize"):
-            return SummarizerAgent(name="summarizer", policy=policy, tools=tools, pool_type_key=type_key)
+            return SummarizerAgent(
+                name="summarizer",
+                policy=policy,
+                tools=tools,
+                pool_type_key=type_key,
+                compact_config=summarizer_compact_cfg,
+                trace_recorder=self.trace_recorder,
+            )
         else:
             # 默认降级为 Researcher
-            return ResearcherAgent(name=f"researcher_default", policy=policy, tools=tools, pool_type_key=type_key)
+            return make_researcher("researcher_default")
 
     def _is_degraded(self, agent: "BaseAgent") -> bool:
         """Return whether a pooled agent should be discarded instead of reused."""

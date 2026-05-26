@@ -60,6 +60,7 @@ class Orchestrator:
         adversarial_loop: Any | None = None,
         memory_store: Any | None = None,
         summarizer_policy: Any | None = None,
+        trace_recorder: Any | None = None,
     ) -> None:
         self.planner = planner
         self.agent_pool = agent_pool
@@ -68,6 +69,7 @@ class Orchestrator:
         self.adversarial_loop = adversarial_loop
         self.memory_store = memory_store
         self.summarizer_policy = summarizer_policy
+        self.trace_recorder = trace_recorder
         self.evidence_store = EvidenceStore()
 
         # 运行时状态（保留 dict 作为快速缓存，M4 提供持久化 + 语义检索）
@@ -120,6 +122,13 @@ class Orchestrator:
         self._dag = None
         self._task_map.clear()
         self._current_state = OrchestratorState.IDLE
+        if self.trace_recorder:
+            self.trace_recorder.record(
+                "run_start",
+                query=query,
+                max_concurrent=self._config.max_concurrent,
+                global_timeout_seconds=self._config.global_timeout_seconds,
+            )
 
         # 状态机主循环
         while self._current_state not in (OrchestratorState.DONE, OrchestratorState.FAILED):
@@ -144,6 +153,12 @@ class Orchestrator:
             self._current_state = next_state
 
             print(f"[Orchestrator] State transition: {self._current_state.value}")
+            if self.trace_recorder:
+                self.trace_recorder.record(
+                    "state_transition",
+                    state=self._current_state.value,
+                    elapsed_seconds=round(time.monotonic() - self._start_time, 3),
+                )
 
         # 返回结果
         if self._current_state == OrchestratorState.DONE:
@@ -153,6 +168,16 @@ class Orchestrator:
                 report = ResearchReport(query=query, content="Report generation failed unexpectedly.")
             report.num_replan = self._replan_count
             report.adversarial_rounds = self._adversarial_count
+            if self.trace_recorder:
+                self.trace_recorder.record(
+                    "run_end",
+                    status="done",
+                    confidence=report.confidence,
+                    num_searches=report.num_searches,
+                    num_replan=report.num_replan,
+                    adversarial_rounds=report.adversarial_rounds,
+                    usage=self._sum_usage(self._results),
+                )
 
             # M4: 将最终报告存入 SharedMemoryStore
             if self.memory_store is not None:
@@ -223,6 +248,15 @@ class Orchestrator:
         # 打印子任务描述以便诊断
         for tid, task in self._task_map.items():
             print(f"[Planning]   {tid}: {task.description}")
+            if self.trace_recorder:
+                self.trace_recorder.record(
+                    "task_planned",
+                    task_id=tid,
+                    task_type=task.task_type.value,
+                    description=task.description,
+                    dependencies=task.dependencies,
+                    timeout_seconds=task.timeout_seconds,
+                )
         return OrchestratorState.DISPATCHING
 
     async def _do_dispatching(self) -> OrchestratorState:
@@ -257,6 +291,14 @@ class Orchestrator:
 
                     # 准备上下文：先执行依赖任务的结果
                     context = self._build_task_context(subtask)
+                    if self.trace_recorder:
+                        self.trace_recorder.record(
+                            "task_start",
+                            task_id=subtask.task_id,
+                            task_type=subtask.task_type.value,
+                            description=subtask.description,
+                            dependencies=subtask.dependencies,
+                        )
 
                     # 获取 Agent
                     agent = await self.agent_pool.get_agent(subtask.task_type)
@@ -281,6 +323,15 @@ class Orchestrator:
                     finally:
                         await self.agent_pool.release_agent(agent)
 
+                    if self.trace_recorder:
+                        self.trace_recorder.record(
+                            "task_end",
+                            task_id=result.task_id,
+                            status=result.status.value,
+                            confidence=result.confidence,
+                            token_usage=result.token_usage,
+                            trajectory_steps=len(result.trajectory),
+                        )
                     return result
 
             # 并发执行本层
@@ -314,6 +365,17 @@ class Orchestrator:
         for r in self._results:
             self.evidence_store.annotate_result(r, task=self._task_map.get(r.task_id))
             self._memory_store[f"result:{r.task_id}"] = r
+            if self.trace_recorder:
+                for item in r.evidence_items:
+                    self.trace_recorder.record(
+                        "evidence_item",
+                        task_id=r.task_id,
+                        level=item.level.value,
+                        claim=item.claim,
+                        source=item.source,
+                        rationale=item.rationale,
+                        confidence=item.confidence,
+                    )
 
         # M4: 将成功结果同步写入 SharedMemoryStore（持久化 + 向量索引）
         if self.memory_store is not None:
@@ -428,15 +490,16 @@ class Orchestrator:
         if result.status == AgentStatus.SUCCESS and isinstance(result.output, ResearchReport):
             self._memory_store["final_report"] = result.output
         else:
-            # 合成失败但已有结果，生成降级报告
-            self._memory_store["final_report"] = ResearchReport(
-                query=self._query,
-                content=str(result.output) if result.output else "Synthesis failed.",
-                confidence=0.0,
-                num_searches=sum(
-                    len([t for t in r.trajectory if t.get("role") == "tool"])
-                    for r in self._results
-                ),
+            # 合成 LLM 失败但已有子任务结果时，生成确定性降级报告，避免把错误字符串当最终产物。
+            self._memory_store["final_report"] = self._build_fallback_report(result)
+        if self.trace_recorder:
+            final_report = self._memory_store.get("final_report")
+            self.trace_recorder.record(
+                "synthesis_end",
+                status=result.status.value,
+                confidence=getattr(final_report, "confidence", 0.0),
+                fallback_used=result.status != AgentStatus.SUCCESS,
+                output_type=type(getattr(result, "output", None)).__name__,
             )
 
         if self._config.enable_adversarial:
@@ -624,6 +687,112 @@ class Orchestrator:
         if evidence_feedback:
             reasons.append(evidence_feedback)
         return "; ".join(reasons) if reasons else "Unknown failure"
+
+    def _build_fallback_report(self, synthesis_result: AgentResult) -> ResearchReport:
+        """Build a deterministic report when the summarizer LLM fails."""
+        success_count = sum(1 for r in self._results if r.status == AgentStatus.SUCCESS)
+        total_count = len(self._results)
+        evidence_summary = self.evidence_store.summarize(self._results)
+        counts = evidence_summary.get("counts", {})
+        num_searches = sum(
+            len([t for t in r.trajectory if t.get("role") == "tool"])
+            for r in self._results
+        )
+
+        lines = [
+            "# 降级研究报告",
+            "",
+            "最终合成模型调用失败，以下内容由 Orchestrator 根据已完成的子任务结果和 evidence items 自动生成。",
+            "",
+            "## 研究问题",
+            "",
+            self._query,
+            "",
+            "## 执行状态",
+            "",
+            f"- 子任务成功率：{success_count}/{total_count}",
+            f"- 工具调用次数：{num_searches}",
+            f"- 合成失败原因：{synthesis_result.output}",
+            "",
+            "## 证据分级统计",
+            "",
+        ]
+        for key in ("verified", "evidence_backed", "speculative", "rejected"):
+            lines.append(f"- {key}: {counts.get(key, 0)}")
+
+        lines.extend(["", "## 关键证据", ""])
+        for level in ("rejected", "verified", "evidence_backed", "speculative"):
+            claims = evidence_summary.get("claims_by_level", {}).get(level, [])
+            if not claims:
+                continue
+            lines.append(f"### {level}")
+            for item in claims[:6]:
+                source = f" 来源：{item.get('source')}" if item.get("source") else ""
+                lines.append(f"- {item.get('claim', '')}{source}")
+            lines.append("")
+
+        lines.extend(["## 子任务结果摘要", ""])
+        for result in self._results:
+            task = self._task_map.get(result.task_id)
+            description = task.description if task else result.task_id
+            lines.append(f"### {result.task_id} [{result.status.value}]")
+            lines.append("")
+            lines.append(description)
+            lines.append("")
+            lines.append(str(result.output)[:1200])
+            lines.append("")
+
+        confidence = round(0.5 * (success_count / max(total_count, 1)), 2)
+        return ResearchReport(
+            query=self._query,
+            content="\n".join(lines),
+            confidence=confidence,
+            num_searches=num_searches,
+            num_replan=self._replan_count,
+            adversarial_rounds=self._adversarial_count,
+            evidence_summary=evidence_summary,
+            tool_trace=self._build_tool_trace(self._results),
+        )
+
+    def _build_tool_trace(self, results: list[AgentResult]) -> list[dict[str, Any]]:
+        trace: list[dict[str, Any]] = []
+        for result in results:
+            for step in result.trajectory:
+                if step.get("role") != "tool":
+                    continue
+                payload = step.get("result")
+                urls = []
+                if isinstance(payload, dict):
+                    for item in payload.get("results", []) or []:
+                        if isinstance(item, dict) and item.get("url"):
+                            urls.append(item["url"])
+                trace.append({
+                    "task_id": result.task_id,
+                    "tool": step.get("name", ""),
+                    "turn": step.get("turn"),
+                    "url_count": len(urls),
+                    "urls": urls[:5],
+                })
+        return trace
+
+    def _sum_usage(self, results: list[AgentResult]) -> dict[str, Any]:
+        totals = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "total_tokens": 0,
+        }
+        for result in results:
+            for step in result.trajectory:
+                usage = step.get("usage") if isinstance(step, dict) else None
+                if not isinstance(usage, dict):
+                    continue
+                for key in totals:
+                    totals[key] += int(usage.get(key, 0) or 0)
+        denominator = totals["input_tokens"] + totals["cache_read_tokens"]
+        totals["cache_hit_rate"] = round(totals["cache_read_tokens"] / denominator, 4) if denominator else 0.0
+        return totals
 
     def _memory_evidence_type(self, evidence) -> str:
         """Map EvidenceLevel to legacy MemoryEntry.evidence_type values."""

@@ -15,6 +15,8 @@ from typing import Optional
 
 from openai import OpenAI
 
+from ..observability import normalize_usage
+
 
 __all__ = ["VLLMPolicy", "OpenAICompatibleDict"]
 
@@ -237,6 +239,7 @@ class VLLMPolicy:
 
             # 6. 返回万能对象
             result = OpenAICompatibleDict(role="assistant", content=content, tool_calls=final_tool_calls)
+            result["usage"] = normalize_usage(getattr(resp, "usage", None))
             if getattr(raw_msg, "reasoning_content", None):
                 result["reasoning_content"] = raw_msg.reasoning_content
             return result
@@ -258,5 +261,6 @@ class VLLMPolicy:
             return OpenAICompatibleDict(
                 role="assistant",
                 content=f"Error: {err_str}",
-                tool_calls=[]
+                tool_calls=[],
+                usage=normalize_usage(None),
             )

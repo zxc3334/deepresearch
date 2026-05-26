@@ -1,7 +1,7 @@
 """Tools 子包：外部能力封装（搜索、论文阅读、代码执行、网页浏览、文件读取、计算、笔记等）。"""
 from __future__ import annotations
 
-from .web_search import WebSearchTool, MockWebSearchTool, BaseWebSearchTool
+from .web_search import WebSearchTool, MockWebSearchTool, OfficialSourceSearchTool, BaseWebSearchTool
 from .arxiv_reader import ArxivReaderTool
 from .code_sandbox import CodeSandboxTool
 from .browser import BrowserTool, MockBrowserTool, BaseBrowserTool, get_browser_tool
@@ -14,6 +14,7 @@ __all__ = [
     # 搜索与阅读
     "WebSearchTool",
     "MockWebSearchTool",
+    "OfficialSourceSearchTool",
     "BaseWebSearchTool",
     "ArxivReaderTool",
     "BrowserTool",

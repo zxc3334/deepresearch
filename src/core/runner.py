@@ -79,6 +79,7 @@ def _create_tools_factory(config: dict):
     from src.tools import (
         WebSearchTool,
         MockWebSearchTool,
+        OfficialSourceSearchTool,
         ArxivReaderTool,
         BrowserTool,
         MockBrowserTool,
@@ -98,6 +99,7 @@ def _create_tools_factory(config: dict):
         tools["web_search"] = MockWebSearchTool()
     else:
         tools["web_search"] = WebSearchTool()
+        tools["official_source_search"] = OfficialSourceSearchTool()
 
     # 2. browser
     if mock_mode:
@@ -148,6 +150,13 @@ def initialize_modules(config: dict, session_id: str = "") -> dict[str, Any]:
     logger.info("正在初始化核心模块...")
 
     modules: dict[str, Any] = {}
+    trace_path = config.get("_trace_path")
+    trace_recorder = None
+    if trace_path:
+        from src.observability import TraceRecorder
+        trace_recorder = TraceRecorder(trace_path, run_id=session_id or None)
+        trace_recorder.record("modules_init_start", session_id=session_id)
+    modules["trace_recorder"] = trace_recorder
 
     # ------------------------------------------------------------------
     # 多后端 LLM 初始化（从 .env + configs/default.yaml 读取配置）
@@ -269,6 +278,8 @@ def initialize_modules(config: dict, session_id: str = "") -> dict[str, Any]:
         policy_factory_by_type={
             "synthesis": lambda: _create_policy("summarizer", use_cache=False),
         },
+        agent_config=config.get("agents", {}),
+        trace_recorder=trace_recorder,
     )
     modules["agent_pool"] = agent_pool
 
@@ -280,6 +291,7 @@ def initialize_modules(config: dict, session_id: str = "") -> dict[str, Any]:
         adversarial_loop=adversarial_loop,
         memory_store=memory_store,
         summarizer_policy=modules.get("summarizer_policy", default_policy),
+        trace_recorder=trace_recorder,
     )
     modules["orchestrator"] = orchestrator
     logger.info("[M1] Orchestrator 模块已初始化")
@@ -289,6 +301,11 @@ def initialize_modules(config: dict, session_id: str = "") -> dict[str, Any]:
         logger.info("[M6] Evolution 模块已启用（预留接口）")
     else:
         logger.info("[M6] Evolution 模块已禁用")
+    if trace_recorder:
+        trace_recorder.record(
+            "modules_init_end",
+            tools=[getattr(tool, "name", type(tool).__name__) for tool in tools_list],
+        )
 
     return modules
 
@@ -321,6 +338,9 @@ async def run_research(query: str, config: dict, modules: dict[str, Any]) -> str
 
     logger = logging.getLogger("runner")
     logger.info(f"开始研究，查询: {query[:80]}...")
+    trace_recorder = modules.get("trace_recorder")
+    if trace_recorder:
+        trace_recorder.record("research_start", query=query)
 
     start_time = time.time()
 
@@ -338,6 +358,13 @@ async def run_research(query: str, config: dict, modules: dict[str, Any]) -> str
     )
 
     report = await orchestrator.run(query, config=run_cfg)
+    if trace_recorder:
+        trace_recorder.record(
+            "research_report_ready",
+            confidence=report.confidence,
+            num_searches=report.num_searches,
+            evidence_counts=getattr(report, "evidence_summary", {}).get("counts", {}),
+        )
     logger.info(
         f"[Orchestrator] 报告生成完成 | 置信度={report.confidence:.2f} | "
         f"搜索轮数={report.num_searches} | 重规划={report.num_replan} | 对抗轮数={report.adversarial_rounds}"
@@ -355,6 +382,8 @@ async def run_research(query: str, config: dict, modules: dict[str, Any]) -> str
 
     elapsed = time.time() - start_time
     logger.info(f"研究完成，耗时: {elapsed:.2f} 秒")
+    if trace_recorder:
+        trace_recorder.record("research_end", elapsed_seconds=round(elapsed, 3))
 
     # 组装最终输出
     final_report = _format_report(report, elapsed)
@@ -398,6 +427,19 @@ def _format_report(report, elapsed: float) -> str:
         lines.append("")
         for key in ("verified", "evidence_backed", "speculative", "rejected"):
             lines.append(f"- **{key}**: {evidence_counts.get(key, 0)}")
+        lines.append("")
+
+    tool_trace = getattr(report, "tool_trace", [])
+    if tool_trace:
+        lines.append("## 工具调用摘要")
+        lines.append("")
+        for i, item in enumerate(tool_trace[:20], 1):
+            urls = item.get("urls", []) or []
+            url_text = ", ".join(urls[:3]) if urls else "无 URL"
+            lines.append(
+                f"{i}. `{item.get('task_id', '')}` -> `{item.get('tool', '')}` "
+                f"(URLs: {item.get('url_count', 0)}) — {url_text}"
+            )
         lines.append("")
 
     if report.sources:

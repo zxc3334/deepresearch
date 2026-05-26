@@ -23,7 +23,7 @@ import aiohttp
 
 from ..utils.env_config import get_env
 
-__all__ = ["WebSearchTool", "MockWebSearchTool", "BaseWebSearchTool"]
+__all__ = ["WebSearchTool", "MockWebSearchTool", "OfficialSourceSearchTool", "BaseWebSearchTool"]
 
 
 class BaseWebSearchTool(ABC):
@@ -533,3 +533,144 @@ class WebSearchTool(BaseWebSearchTool):
             "total": len(results),
             "source": "metaso",
         }
+
+
+class OfficialSourceSearchTool:
+    """Search official GIS/remote-sensing documentation through WebSearchTool."""
+
+    name = "official_source_search"
+    description = (
+        "Search official GIS/remote-sensing sources such as ESA, USGS, NASA, Copernicus, "
+        "Google Earth Engine docs, and Microsoft Planetary Computer. "
+        "Use this for sensor capabilities, product specs, bands, resolutions, algorithms, and data access facts. "
+        "Input: {'query': str, 'top_n': int(optional), 'domains': list[str](optional)}."
+    )
+
+    default_domains = [
+        "sentinel.esa.int",
+        "sentinels.copernicus.eu",
+        "sentiwiki.copernicus.eu",
+        "documentation.dataspace.copernicus.eu",
+        "esa.int",
+        "usgs.gov",
+        "nasa.gov",
+        "modis.gsfc.nasa.gov",
+        "lpdaac.usgs.gov",
+        "copernicus.eu",
+        "developers.google.com/earth-engine",
+        "planetarycomputer.microsoft.com",
+    ]
+
+    def __init__(self, search_tool: WebSearchTool | None = None, max_domain_queries: int = 4) -> None:
+        self.search_tool = search_tool or WebSearchTool()
+        self.max_domain_queries = max_domain_queries
+
+    def get_openai_tool_schema(self) -> dict:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Fact to verify from official GIS/RS sources."},
+                        "top_n": {"type": "integer", "description": "Maximum merged results.", "default": 5},
+                        "domains": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Optional official domains to prioritize.",
+                        },
+                    },
+                    "required": ["query"],
+                },
+            },
+        }
+
+    async def execute(
+        self,
+        query: str,
+        top_n: int = 5,
+        domains: list[str] | None = None,
+    ) -> dict[str, Any]:
+        selected_domains = (domains or self.default_domains)[:self.max_domain_queries]
+        per_domain = max(1, min(3, top_n))
+        merged: list[dict[str, Any]] = self._curated_official_sources(query)
+        errors: list[str] = []
+
+        for domain in selected_domains:
+            domain_query = f"{query} site:{domain}"
+            result = await self.search_tool.execute(domain_query, top_n=per_domain)
+            if result.get("error"):
+                errors.append(f"{domain}: {result['error']}")
+                continue
+            for item in result.get("results", []):
+                if not isinstance(item, dict):
+                    continue
+                if not self._url_matches_domain(item.get("url", ""), domain):
+                    continue
+                normalized = dict(item)
+                normalized["official_domain"] = domain
+                normalized["source_type"] = "official"
+                merged.append(normalized)
+
+        results = self.search_tool._deduplicate_results(merged)[:top_n]
+        return {
+            "query": query,
+            "domains": selected_domains,
+            "results": results,
+            "total": len(results),
+            "source": f"official_source_search:{self.search_tool.backend}",
+            "errors": errors,
+            "evidence_level": "evidence_backed" if results else "speculative",
+        }
+
+    def _curated_official_sources(self, query: str) -> list[dict[str, Any]]:
+        """Return stable official URL seeds from the local GIS/RS registry."""
+        query_lower = query.lower()
+        results: list[dict[str, Any]] = []
+        try:
+            from .geo_registry import DATASETS
+        except Exception:
+            return results
+
+        for key, record in DATASETS.items():
+            aliases = [key] + record.get("aliases", [])
+            variables = record.get("variables", [])
+            if not any(str(token).lower() in query_lower for token in aliases + variables):
+                continue
+            snippet = "; ".join(record.get("limitations", [])[:2]) or record.get("spatial_resolution", "")
+            for source in record.get("official_sources", []):
+                if not isinstance(source, dict):
+                    continue
+                results.append({
+                    "title": source.get("title", record.get("dataset", "")),
+                    "url": source.get("url", ""),
+                    "snippet": snippet,
+                    "official_domain": "curated-registry",
+                    "source_type": "official-curated",
+                })
+        return results
+
+    def _url_matches_domain(self, url: str, domain: str) -> bool:
+        from urllib.parse import urlparse
+
+        if not url:
+            return False
+        try:
+            parsed_url = urlparse(url)
+            domain_spec = urlparse(domain if "://" in domain else f"https://{domain}")
+        except Exception:
+            return False
+        host = parsed_url.netloc.lower()
+        if host.startswith("www."):
+            host = host[4:]
+        expected_host = domain_spec.netloc.lower()
+        if expected_host.startswith("www."):
+            expected_host = expected_host[4:]
+        if not (host == expected_host or host.endswith("." + expected_host)):
+            return False
+        expected_path = domain_spec.path.rstrip("/")
+        if expected_path:
+            return parsed_url.path == expected_path or parsed_url.path.startswith(expected_path + "/")
+        return True

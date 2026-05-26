@@ -29,8 +29,39 @@ class SummarizerAgent(BaseAgent):
         max_output_tokens: 报告生成的最大 token 数（通过 policy.max_tokens 控制）。
     """
 
-    def __init__(self, name: str, policy, tools: list | None = None, pool_type_key: str | None = None) -> None:
+    default_context_budget_tokens = 24000
+    default_compact_threshold_ratio = 0.70
+    default_compact_result_chars = 1800
+    default_compact_evidence_items_per_result = 6
+    default_chars_per_token = 3.5
+
+    def __init__(
+        self,
+        name: str,
+        policy,
+        tools: list | None = None,
+        pool_type_key: str | None = None,
+        compact_config: dict | None = None,
+        trace_recorder=None,
+    ) -> None:
         super().__init__(name, policy, tools, pool_type_key=pool_type_key)
+        compact_config = compact_config or {}
+        self.trace_recorder = trace_recorder
+        self.context_budget_tokens = compact_config.get(
+            "context_budget_tokens", self.default_context_budget_tokens
+        )
+        self.compact_threshold_ratio = compact_config.get(
+            "compact_threshold_ratio", self.default_compact_threshold_ratio
+        )
+        self.compact_result_chars = compact_config.get(
+            "compact_result_chars", self.default_compact_result_chars
+        )
+        self.compact_evidence_items_per_result = compact_config.get(
+            "compact_evidence_items_per_result", self.default_compact_evidence_items_per_result
+        )
+        self.chars_per_token = compact_config.get(
+            "chars_per_token", self.default_chars_per_token
+        )
 
     @trace_agent(name="summarizer.run", tags=["agent", "summarizer"])
     async def run(self, task: SubTask, context: dict) -> AgentResult:
@@ -104,7 +135,26 @@ class SummarizerAgent(BaseAgent):
             self.policy.tools = old_tools
 
         content = response.get("content", "") or ""
-        token_usage = len(content) // 3  # 简化估算
+        usage = response.get("usage", {}) or {}
+        if self.trace_recorder:
+            self.trace_recorder.record(
+                "llm_call",
+                task_id=task.task_id,
+                role="summarizer",
+                usage=usage,
+                output_chars=len(content),
+            )
+        if self._is_policy_error_content(content):
+            return self.finalize_result(AgentResult(
+                task_id=task.task_id,
+                status=AgentStatus.FAILED,
+                output=f"Synthesis failed: {content}",
+                trajectory=[{"role": "assistant", "content": content}],
+                token_usage=0,
+                confidence=0.0,
+            ))
+
+        token_usage = usage.get("total_tokens", 0) or len(content) // 3  # fallback estimate
 
         # 解析报告内容，提取来源和置信度
         report = self._parse_report(query, content, results)
@@ -113,7 +163,7 @@ class SummarizerAgent(BaseAgent):
             task_id=task.task_id,
             status=AgentStatus.SUCCESS,
             output=report,
-            trajectory=[{"role": "assistant", "content": content}],
+            trajectory=[{"role": "assistant", "content": content, "usage": usage}],
             token_usage=token_usage,
             confidence=report.confidence,
         ))
@@ -149,6 +199,51 @@ class SummarizerAgent(BaseAgent):
         evidence_summary: dict | None = None,
     ) -> str:
         """构建合成 prompt，按置信度降序排列结果。"""
+        prompt = self._build_synthesis_prompt_with_mode(
+            query=query,
+            results=results,
+            domain=domain,
+            evidence_summary=evidence_summary,
+            compact=False,
+        )
+        threshold_chars = int(
+            self.context_budget_tokens
+            * self.chars_per_token
+            * self.compact_threshold_ratio
+        )
+        if len(prompt) <= threshold_chars:
+            return prompt
+
+        compact_prompt = self._build_synthesis_prompt_with_mode(
+            query=query,
+            results=results,
+            domain=domain,
+            evidence_summary=evidence_summary,
+            compact=True,
+        )
+        if compact_prompt == prompt or "[compact]" not in compact_prompt:
+            return prompt
+        print(f"[compact] summarizer_prompt chars={len(prompt)}->{len(compact_prompt)} threshold={threshold_chars}")
+        if self.trace_recorder:
+            self.trace_recorder.record(
+                "compact",
+                scope="synthesis_prompt",
+                before_chars=len(prompt),
+                after_chars=len(compact_prompt),
+                threshold_chars=threshold_chars,
+                strategy="head_tail_70_30",
+            )
+        return compact_prompt
+
+    def _build_synthesis_prompt_with_mode(
+        self,
+        query: str,
+        results: list[AgentResult],
+        domain: str = "general",
+        evidence_summary: dict | None = None,
+        compact: bool = False,
+    ) -> str:
+        """Build synthesis prompt; compact mode preserves errors and head/tail evidence."""
         sorted_results = sorted(results, key=lambda r: r.confidence, reverse=True)
 
         parts = [
@@ -159,12 +254,13 @@ class SummarizerAgent(BaseAgent):
             parts.append(self._format_evidence_summary(evidence_summary))
         for i, r in enumerate(sorted_results, 1):
             status_icon = "✓" if r.status == AgentStatus.SUCCESS else "✗"
-            evidence_block = self._format_result_evidence(r)
+            evidence_block = self._format_result_evidence(r, compact=compact)
+            output_text = self._format_result_output(r, compact=compact)
             parts.append(
                 f"## Result {i} [{status_icon}] (confidence: {r.confidence:.2f})\n"
                 f"Task: {r.task_id}\n"
                 f"{evidence_block}"
-                f"Output:\n{r.output}\n"
+                f"Output:\n{output_text}\n"
             )
 
         if domain == "geo_remote_sensing":
@@ -211,18 +307,57 @@ class SummarizerAgent(BaseAgent):
             lines.append(f"- {key}: {counts.get(key, 0)}")
         return "\n".join(lines) + "\n"
 
-    def _format_result_evidence(self, result: AgentResult) -> str:
+    def _format_result_evidence(self, result: AgentResult, compact: bool = False) -> str:
         """Render per-result evidence items for synthesis."""
         if not result.evidence_items:
             return ""
         lines = ["Evidence:"]
-        for item in result.evidence_items:
+        items = result.evidence_items
+        if compact and result.status == AgentStatus.SUCCESS:
+            items = result.evidence_items[:self.compact_evidence_items_per_result]
+        for item in items:
             source = f" | source: {item.source}" if item.source else ""
             lines.append(
                 f"- level={item.level.value}, confidence={item.confidence:.2f}{source}; "
                 f"rationale={item.rationale}"
             )
+        remaining = len(result.evidence_items) - len(items)
+        if compact and remaining > 0:
+            lines.append(f"- [compact] {remaining} more evidence items omitted from synthesis prompt.")
         return "\n".join(lines) + "\n"
+
+    def _format_result_output(self, result: AgentResult, compact: bool = False) -> str:
+        text = str(result.output)
+        if not compact or result.status != AgentStatus.SUCCESS or self._is_policy_error_content(text):
+            return text
+        if len(text) <= self.compact_result_chars:
+            return text
+        return self._head_tail_compact(text, self.compact_result_chars)
+
+    def _head_tail_compact(self, text: str, max_chars: int, head_ratio: float = 0.70) -> str:
+        head_chars = max(1, int(max_chars * head_ratio))
+        tail_chars = max(1, max_chars - head_chars)
+        omitted = max(0, len(text) - head_chars - tail_chars)
+        return (
+            f"{text[:head_chars].rstrip()}\n"
+            f"[compact] omitted {omitted} chars from middle; preserved head/tail 70/30.\n"
+            f"{text[-tail_chars:].lstrip()}"
+        )
+
+    def _is_policy_error_content(self, content: str) -> bool:
+        """Detect provider errors wrapped as assistant content by policy layer."""
+        text = (content or "").strip().lower()
+        if not text:
+            return True
+        error_prefixes = ("error:", "policy error:")
+        error_markers = (
+            "connection error",
+            "request timed out",
+            "timeout",
+            "maximum context length",
+            "context length",
+        )
+        return text.startswith(error_prefixes) and any(marker in text for marker in error_markers)
 
     def _parse_report(self, query: str, content: str, results: list[AgentResult]) -> ResearchReport:
         """从 LLM 输出中解析 ResearchReport，并基于子任务成功率校准置信度。"""
@@ -295,6 +430,7 @@ class SummarizerAgent(BaseAgent):
             confidence=confidence,
             num_searches=num_searches,
             evidence_summary=evidence_summary,
+            tool_trace=self._build_tool_trace(results),
         )
 
     def _summarize_result_evidence(self, results: list[AgentResult]) -> dict[str, Any]:
@@ -306,3 +442,24 @@ class SummarizerAgent(BaseAgent):
                 counts[level] = counts.get(level, 0) + 1
                 claims_by_level.setdefault(level, []).append(item.to_dict())
         return {"counts": counts, "claims_by_level": claims_by_level}
+
+    def _build_tool_trace(self, results: list[AgentResult]) -> list[dict[str, Any]]:
+        trace: list[dict[str, Any]] = []
+        for result in results:
+            for step in result.trajectory:
+                if step.get("role") != "tool":
+                    continue
+                payload = step.get("result")
+                urls = []
+                if isinstance(payload, dict):
+                    for item in payload.get("results", []) or []:
+                        if isinstance(item, dict) and item.get("url"):
+                            urls.append(item["url"])
+                trace.append({
+                    "task_id": result.task_id,
+                    "tool": step.get("name", ""),
+                    "turn": step.get("turn"),
+                    "url_count": len(urls),
+                    "urls": urls[:5],
+                })
+        return trace

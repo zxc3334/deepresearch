@@ -45,6 +45,7 @@ def main() -> None:
         args.output_dir,
         f"run_{_dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     )
+    trace_filename = os.path.join(args.output_dir, "trace.jsonl")
 
     class Tee:
         """同时输出到终端和文件的包装器。"""
@@ -71,7 +72,9 @@ def main() -> None:
 
     try:
         config = load_config(args.config)
+        config["_trace_path"] = trace_filename
         logger.info(f"配置加载完成: {args.config or 'configs/default.yaml'}")
+        logger.info(f"JSONL trace 将保存到: {trace_filename}")
 
         modules = initialize_modules(config, session_id=args.session_id)
         report = asyncio.run(run_research(args.query, config, modules))

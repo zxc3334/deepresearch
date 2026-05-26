@@ -42,12 +42,15 @@ class ResearcherAgent(BaseAgent):
         tools: list | None = None,
         max_turns: int = 10,
         pool_type_key: str | None = None,
+        loop_config: ToolLoopConfig | None = None,
+        trace_recorder=None,
     ) -> None:
         super().__init__(name, policy, tools, pool_type_key=pool_type_key)
         self.max_turns = max_turns
         self.prompt_builder = ResearchPromptBuilder()
         self.tool_registry = ToolRegistry(tools)
-        self.loop_config = ToolLoopConfig(max_turns=max_turns)
+        self.loop_config = loop_config or ToolLoopConfig(max_turns=max_turns)
+        self.trace_recorder = trace_recorder
         # Compatibility alias for code that still reads researcher.tool_map.
         self.tool_map: dict[str, Any] = self.tool_registry.tool_map
 
@@ -63,6 +66,7 @@ class ResearcherAgent(BaseAgent):
             policy=self.policy,
             tool_registry=self.tool_registry,
             config=self.loop_config,
+            trace_recorder=self.trace_recorder,
         )
         result = await loop.run(
             task=task,

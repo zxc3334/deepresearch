@@ -14,6 +14,8 @@ class ResearchPromptBuilder:
             "\n\nAVAILABLE TOOLS:\n"
             "- web_search: General web search for news, market data, industry reports, current events. "
             "  Use this as the FIRST tool for most tasks.\n"
+            "- official_source_search: Official GIS/remote-sensing documentation search. "
+            "  USE for ESA/USGS/NASA/Copernicus/GEE product specs, sensor bands, algorithms, and official data access facts.\n"
             "- arxiv_reader: Academic paper search (ArXiv / Semantic Scholar). "
             "  USE when the task involves: papers, publications, academic research, citation counts.\n"
             "- browser: Open a URL and extract full webpage text. "
@@ -35,7 +37,8 @@ class ResearchPromptBuilder:
             "\nIMPORTANT RULES:\n"
             "1. You MUST use a tool to find factual information. Do NOT answer from your own knowledge.\n"
             "2. Choose the RIGHT tool based on the task type. You can use MULTIPLE tools in sequence.\n"
-            "3. For most research tasks, START with web_search or arxiv_reader.\n"
+            "3. For GIS/remote-sensing factual validation, START with official_source_search or a GIS registry tool. "
+            "For general tasks, START with web_search or arxiv_reader.\n"
             "4. If search results are too short, use browser to read the full article.\n"
             "5. If the task involves numbers/calculations, use calculator or code_sandbox.\n"
             "6. You may call tools AT MOST 2 times total. After that you MUST summarize.\n"
@@ -63,6 +66,14 @@ class ResearchPromptBuilder:
         academic_keywords = ["论文", "paper", "publication", "学术", "arxiv", "neurips", "icml", "iclr", "scholar", "citation", "文献"]
         if any(kw in desc_lower for kw in academic_keywords):
             tool_recommendations.append("arxiv_reader")
+
+        official_keywords = [
+            "official", "documentation", "docs", "handbook", "user guide",
+            "esa", "usgs", "nasa", "copernicus", "earth engine", "gee",
+            "官方", "文档", "手册", "产品说明", "技术报告", "数据门户",
+        ]
+        if any(kw in desc_lower for kw in official_keywords):
+            tool_recommendations.append("official_source_search")
 
         calc_keywords = ["计算", "flops", "显存", "内存", "参数量", "延迟", "成本", "公式", "数值", "统计", "数学", "公式", "推导"]
         if any(kw in desc_lower for kw in calc_keywords):
@@ -100,6 +111,8 @@ class ResearchPromptBuilder:
 
         if "geo_plan_validator" in tool_recommendations:
             tool_recommendations = ["geo_plan_validator"] + [t for t in tool_recommendations if t != "geo_plan_validator"]
+        elif "official_source_search" in tool_recommendations:
+            tool_recommendations = ["official_source_search"] + [t for t in tool_recommendations if t != "official_source_search"]
         elif "dataset_registry" in tool_recommendations:
             tool_recommendations = ["dataset_registry"] + [t for t in tool_recommendations if t != "dataset_registry"]
         elif "method_registry" in tool_recommendations:
