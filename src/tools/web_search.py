@@ -16,18 +16,22 @@ import asyncio
 import json
 import os
 import random
+import re
 from abc import ABC, abstractmethod
 from typing import Any
 
 import aiohttp
 
 from ..utils.env_config import get_env
+from ..utils.domain_tiers import authority_score, classify_url
 
 __all__ = ["WebSearchTool", "MockWebSearchTool", "OfficialSourceSearchTool", "BaseWebSearchTool"]
 
 
 class BaseWebSearchTool(ABC):
     """网页搜索工具抽象基类。"""
+
+    MAX_SNIPPET_CHARS = 500
 
     name: str = "web_search"
     description: str = (
@@ -41,6 +45,53 @@ class BaseWebSearchTool(ABC):
     async def execute(self, query: str, top_n: int = 5) -> dict[str, Any]:
         """执行搜索并返回结果。"""
         pass
+
+    def _rank_results(self, results: list[dict[str, Any]], query: str, top_n: int | None = None) -> list[dict[str, Any]]:
+        """Normalize, score, and rank search results by source quality and query relevance."""
+        ranked: list[dict[str, Any]] = []
+        query_terms = self._query_terms(query)
+
+        for position, raw in enumerate(results):
+            if not isinstance(raw, dict):
+                continue
+            item = self._normalize_result(raw)
+            score = authority_score(item.get("url", ""))
+            score += self._query_relevance_score(item, query_terms)
+            score -= min(position, 10) * 0.1
+            item["_quality_score"] = round(score, 2)
+            item["_source_tier"] = classify_url(item.get("url", "")).value
+            ranked.append(item)
+
+        ranked.sort(key=lambda item: item.get("_quality_score", 0.0), reverse=True)
+        if top_n is not None:
+            return ranked[:top_n]
+        return ranked
+
+    def _normalize_result(self, result: dict[str, Any]) -> dict[str, Any]:
+        item = dict(result)
+        item["title"] = str(item.get("title", "") or "")
+        item["url"] = str(item.get("url", "") or "")
+        item["snippet"] = self._truncate_snippet(str(item.get("snippet", "") or ""))
+        return item
+
+    def _truncate_snippet(self, snippet: str) -> str:
+        if len(snippet) <= self.MAX_SNIPPET_CHARS:
+            return snippet
+        return snippet[: self.MAX_SNIPPET_CHARS].rstrip()
+
+    def _query_terms(self, query: str) -> set[str]:
+        return {term for term in re.findall(r"[a-zA-Z0-9_\-]{3,}", query.lower())}
+
+    def _query_relevance_score(self, item: dict[str, Any], query_terms: set[str]) -> float:
+        if not query_terms:
+            return 0.0
+        title = str(item.get("title", "")).lower()
+        snippet = str(item.get("snippet", "")).lower()
+        url = str(item.get("url", "")).lower()
+        title_hits = sum(1 for term in query_terms if term in title)
+        snippet_hits = sum(1 for term in query_terms if term in snippet)
+        url_hits = sum(1 for term in query_terms if term in url)
+        return min(10.0, title_hits * 3.0 + snippet_hits * 1.0 + url_hits * 0.5)
 
     def get_openai_tool_schema(self) -> dict:
         return {
@@ -115,7 +166,7 @@ class MockWebSearchTool(BaseWebSearchTool):
             if key not in seen:
                 seen.add(key)
                 unique.append(r)
-        results = unique[:top_n]
+        results = unique
 
         if not results:
             results = [
@@ -125,6 +176,8 @@ class MockWebSearchTool(BaseWebSearchTool):
                     "snippet": "This is a mock search result for testing purposes.",
                 }
             ]
+
+        results = self._rank_results(results, query, top_n=top_n)
 
         return {
             "query": query,
@@ -249,6 +302,8 @@ class WebSearchTool(BaseWebSearchTool):
                 "snippet": item.get("snippet", ""),
             })
 
+        results = self._rank_results(results, query, top_n=top_n)
+
         return {
             "query": query,
             "results": results,
@@ -301,6 +356,8 @@ class WebSearchTool(BaseWebSearchTool):
                 "url": item.get("url", ""),
                 "snippet": item.get("snippet", ""),
             })
+
+        results = self._rank_results(results, query, top_n=top_n)
 
         return {
             "query": query,
@@ -384,7 +441,7 @@ class WebSearchTool(BaseWebSearchTool):
                     })
 
         # 去重：同一篇文章的不同 URL（移动端/PC端/转发）会被当作多条结果
-        results = self._deduplicate_results(results)
+        results = self._rank_results(self._deduplicate_results(results), query, top_n=top_n)
 
         return {
             "query": query,
@@ -527,6 +584,8 @@ class WebSearchTool(BaseWebSearchTool):
                 "snippet": " | ".join(snippet_parts)[:500],
             })
 
+        results = self._rank_results(results, query, top_n=top_n)
+
         return {
             "query": query,
             "results": results,
@@ -614,13 +673,13 @@ class OfficialSourceSearchTool:
                 normalized["source_type"] = "official"
                 merged.append(normalized)
 
-        results = self.search_tool._deduplicate_results(merged)[:top_n]
+        results = self.search_tool._rank_results(self.search_tool._deduplicate_results(merged), query, top_n=top_n)
         return {
             "query": query,
             "domains": selected_domains,
             "results": results,
             "total": len(results),
-            "source": f"official_source_search:{self.search_tool.backend}",
+            "source": f"official_source_search:{getattr(self.search_tool, 'backend', self.search_tool.name)}",
             "errors": errors,
             "evidence_level": "evidence_backed" if results else "speculative",
         }
