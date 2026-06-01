@@ -76,7 +76,7 @@ class ResearcherAgent(BaseAgent):
         )
         result = await loop.run(
             task=task,
-            system_prompt=self.prompt_builder.system_prompt(),
+            system_prompt=self.prompt_builder.system_prompt(self.tool_registry.tools),
             user_prompt=task_prompt,
         )
         if prefetch_steps:
