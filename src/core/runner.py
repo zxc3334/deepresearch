@@ -289,6 +289,7 @@ def initialize_modules(config: dict, session_id: str = "") -> dict[str, Any]:
         },
         agent_config=config.get("agents", {}),
         trace_recorder=trace_recorder,
+        progress_callback=config.get("_progress_callback"),
     )
     modules["agent_pool"] = agent_pool
 
@@ -301,6 +302,9 @@ def initialize_modules(config: dict, session_id: str = "") -> dict[str, Any]:
         memory_store=memory_store,
         summarizer_policy=modules.get("summarizer_policy", default_policy),
         trace_recorder=trace_recorder,
+        progress_callback=config.get("_progress_callback"),
+        interactive_bus=config.get("_interactive_bus"),
+        context_modifier=config.get("_context_modifier"),
     )
     modules["orchestrator"] = orchestrator
     logger.info("[M1] Orchestrator 模块已初始化")

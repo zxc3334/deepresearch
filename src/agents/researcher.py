@@ -45,6 +45,7 @@ class ResearcherAgent(BaseAgent):
         loop_config: ToolLoopConfig | None = None,
         external_prefetch_config: dict[str, Any] | None = None,
         trace_recorder=None,
+        progress_callback=None,
     ) -> None:
         super().__init__(name, policy, tools, pool_type_key=pool_type_key)
         self.max_turns = max_turns
@@ -53,6 +54,7 @@ class ResearcherAgent(BaseAgent):
         self.loop_config = loop_config or ToolLoopConfig(max_turns=max_turns)
         self.external_prefetch_config = external_prefetch_config or {}
         self.trace_recorder = trace_recorder
+        self.progress_callback = progress_callback
         # Compatibility alias for code that still reads researcher.tool_map.
         self.tool_map: dict[str, Any] = self.tool_registry.tool_map
 
@@ -73,6 +75,7 @@ class ResearcherAgent(BaseAgent):
             tool_registry=self.tool_registry,
             config=self.loop_config,
             trace_recorder=self.trace_recorder,
+            progress_callback=self.progress_callback,
         )
         result = await loop.run(
             task=task,

@@ -40,6 +40,7 @@ class AgentPool:
         policy_factory_by_type: dict[str, Callable] | None = None,
         agent_config: dict | None = None,
         trace_recorder=None,
+        progress_callback=None,
     ) -> None:
         self.policy_factory = policy_factory
         self.tools_factory = tools_factory
@@ -47,6 +48,7 @@ class AgentPool:
         self.policy_factory_by_type = policy_factory_by_type or {}
         self.agent_config = agent_config or {}
         self.trace_recorder = trace_recorder
+        self.progress_callback = progress_callback
 
         # 类型 -> 空闲 Agent 列表
         self._idle: dict[str, list[BaseAgent]] = {}
@@ -169,6 +171,7 @@ class AgentPool:
                 loop_config=tool_loop_config,
                 external_prefetch_config=researcher_cfg.get("external_prefetch", {}),
                 trace_recorder=self.trace_recorder,
+                progress_callback=self.progress_callback,
             )
 
         if type_key == TaskType.SEARCH.value:

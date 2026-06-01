@@ -27,6 +27,7 @@ from .schemas import (
     TaskType,
 )
 from .agent_pool import AgentPool
+from .interaction import ContextModifier, InteractiveBus, ProgressBus, default_context_modifier
 from ..planner.dag import DAG
 from ..planner.planner import Planner, PlanParseError
 from ..planner.budget_tracker import BudgetTracker
@@ -61,6 +62,9 @@ class Orchestrator:
         memory_store: Any | None = None,
         summarizer_policy: Any | None = None,
         trace_recorder: Any | None = None,
+        progress_callback: Callable[[dict[str, Any]], Any] | None = None,
+        interactive_bus: InteractiveBus | None = None,
+        context_modifier: ContextModifier | None = None,
     ) -> None:
         self.planner = planner
         self.agent_pool = agent_pool
@@ -70,6 +74,11 @@ class Orchestrator:
         self.memory_store = memory_store
         self.summarizer_policy = summarizer_policy
         self.trace_recorder = trace_recorder
+        self.progress_bus = ProgressBus(progress_callback)
+        if progress_callback is not None and hasattr(self.agent_pool, "progress_callback"):
+            self.agent_pool.progress_callback = progress_callback
+        self.interactive_bus = interactive_bus
+        self.context_modifier = context_modifier or default_context_modifier
         self.evidence_store = EvidenceStore()
 
         # 运行时状态（保留 dict 作为快速缓存，M4 提供持久化 + 语义检索）
@@ -131,6 +140,11 @@ class Orchestrator:
                 max_concurrent=self._config.max_concurrent,
                 global_timeout_seconds=self._config.global_timeout_seconds,
             )
+        await self._publish_progress(
+            "run_start",
+            query=query,
+            max_concurrent=self._config.max_concurrent,
+        )
 
         # 状态机主循环
         while self._current_state not in (OrchestratorState.DONE, OrchestratorState.FAILED):
@@ -232,6 +246,7 @@ class Orchestrator:
         失败时直接转入 FAILED（初始计划失败无法恢复）。
         """
         try:
+            await self._publish_progress("planning_start", query=self._query)
             memory_ctx = self._build_memory_context()
             self._dag = self.planner.generate_plan(self._query, memory_ctx)
             # 从 planner 获取完整的 SubTask 信息（包括 description、search_hints 等）
@@ -249,9 +264,17 @@ class Orchestrator:
         n_tasks = len(self._dag)
         n_layers = len(self._dag.get_parallel_groups()) if self._dag else 0
         print(f"[Planning] ✓ DAG 生成完成: {n_tasks} 个子任务, {n_layers} 个执行层")
+        await self._publish_progress("planning_end", task_count=n_tasks, layer_count=n_layers)
         # 打印子任务描述以便诊断
         for tid, task in self._task_map.items():
             print(f"[Planning]   {tid}: {task.description}")
+            await self._publish_progress(
+                "task_planned",
+                task_id=tid,
+                task_type=task.task_type.value,
+                description=task.description,
+                dependencies=task.dependencies,
+            )
             if self.trace_recorder:
                 self.trace_recorder.record(
                     "task_planned",
@@ -281,6 +304,11 @@ class Orchestrator:
 
         for layer_idx, group in enumerate(parallel_groups):
             print(f"[Dispatch] ▶ Layer {layer_idx + 1}/{len(parallel_groups)}: {group} (并行执行)")
+            await self._publish_progress(
+                "dispatch_layer_start",
+                layer_index=layer_idx,
+                task_ids=list(group),
+            )
 
             # 构建本层的 coroutine 列表
             async def _run_one(task_id: str) -> AgentResult:
@@ -295,6 +323,12 @@ class Orchestrator:
 
                     # 准备上下文：先执行依赖任务的结果
                     context = self._build_task_context(subtask)
+                    await self._publish_progress(
+                        "task_start",
+                        task_id=subtask.task_id,
+                        task_type=subtask.task_type.value,
+                        description=subtask.description,
+                    )
                     if self.trace_recorder:
                         self.trace_recorder.record(
                             "task_start",
@@ -336,6 +370,13 @@ class Orchestrator:
                             token_usage=result.token_usage,
                             trajectory_steps=len(result.trajectory),
                         )
+                    await self._publish_progress(
+                        "task_end",
+                        task_id=result.task_id,
+                        status=result.status.value,
+                        confidence=result.confidence,
+                        token_usage=result.token_usage,
+                    )
                     return result
 
             # 并发执行本层
@@ -684,7 +725,51 @@ class Orchestrator:
             dep_key = f"result:{dep_id}"
             if dep_key in self._memory_store:
                 ctx[f"dep:{dep_id}"] = self._memory_store[dep_key]
+        ctx = self._apply_user_instructions(subtask, ctx)
         return ctx
+
+    def _apply_user_instructions(self, subtask: SubTask, context: dict) -> dict:
+        if self.interactive_bus is None or not self.interactive_bus.has_pending():
+            return context
+        instructions = self.interactive_bus.drain_instructions(subtask.task_id)
+        if not instructions:
+            return context
+        for instruction in instructions:
+            if self.trace_recorder:
+                self.trace_recorder.record(
+                    "user_instruction_received",
+                    task_id=subtask.task_id,
+                    target_task_id=instruction.task_id,
+                    text=instruction.text,
+                    source=instruction.source,
+                )
+        try:
+            updated = self.context_modifier(context, instructions)
+            if updated is None:
+                updated = context
+        except Exception as exc:
+            if self.trace_recorder:
+                self.trace_recorder.record(
+                    "context_modifier_error",
+                    task_id=subtask.task_id,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+            return context
+        if self.trace_recorder:
+            self.trace_recorder.record(
+                "user_instruction_applied",
+                task_id=subtask.task_id,
+                instruction_count=len(instructions),
+            )
+            self.trace_recorder.record(
+                "context_modified",
+                task_id=subtask.task_id,
+                keys=sorted(set(updated) - set(context)),
+            )
+        return updated
+
+    async def _publish_progress(self, event_type: str, **payload: Any) -> None:
+        await self.progress_bus.publish(event_type, **payload)
 
     def _build_failure_reason(self, results: list[AgentResult]) -> str:
         """分析失败原因，生成给 replanner 的描述。"""

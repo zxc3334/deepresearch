@@ -39,11 +39,13 @@ class ToolCallingLoop:
         tool_registry: ToolRegistry,
         config: ToolLoopConfig | None = None,
         trace_recorder=None,
+        progress_callback=None,
     ) -> None:
         self.policy = policy
         self.tool_registry = tool_registry
         self.config = config or ToolLoopConfig()
         self.trace_recorder = trace_recorder
+        self.progress_callback = progress_callback
         self.messages: list[dict] = []
         self.trajectory: list[dict] = []
         self.total_tokens: int = 0
@@ -167,6 +169,13 @@ class ToolCallingLoop:
             except json.JSONDecodeError:
                 args = {}
 
+            await self._publish_progress(
+                "tool_call_start",
+                task_id=task.task_id,
+                turn=turn,
+                tool_name=tool_name,
+                args_summary=self._summarize_args(args),
+            )
             result = await self.tool_registry.execute(tool_name, args)
             if self.trace_recorder:
                 self.trace_recorder.record(
@@ -195,6 +204,13 @@ class ToolCallingLoop:
                     "name": tool_name,
                     "error": error_msg,
                 })
+                await self._publish_progress(
+                    "tool_call_error",
+                    task_id=task.task_id,
+                    turn=turn,
+                    tool_name=tool_name,
+                    error=error_msg,
+                )
                 return AgentResult(
                     task_id=task.task_id,
                     status=AgentStatus.FAILED,
@@ -211,6 +227,13 @@ class ToolCallingLoop:
             }
             self._log_tool_result(task, turn, tool_name, args, result)
             self._trace_tool_result(task, turn, tool_name, result)
+            await self._publish_progress(
+                "tool_call_result",
+                task_id=task.task_id,
+                turn=turn,
+                tool_name=tool_name,
+                result_summary=self._summarize_tool_result(result),
+            )
             tool_results.append(tool_result)
             self.trajectory.append({
                 "turn": turn,
@@ -221,6 +244,52 @@ class ToolCallingLoop:
             })
 
         return tool_results
+
+    async def _publish_progress(self, event_type: str, **payload: Any) -> None:
+        callback = self.progress_callback
+        if callback is None:
+            return
+        event = {"event_type": event_type, **payload}
+        try:
+            result = callback(event)
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception:
+            return
+
+    def _summarize_args(self, args: dict[str, Any]) -> dict[str, Any]:
+        summary: dict[str, Any] = {}
+        for key in ("query", "paper_id", "url", "top_n", "max_results"):
+            if key in args:
+                value = args[key]
+                summary[key] = str(value)[:300] if isinstance(value, str) else value
+        return summary
+
+    def _summarize_tool_result(self, result: Any) -> dict[str, Any]:
+        if not isinstance(result, dict):
+            return {"result_type": type(result).__name__}
+        items: list[dict[str, Any]] = []
+        for item in result.get("results", []) or []:
+            if isinstance(item, dict):
+                items.append({
+                    "title": str(item.get("title", ""))[:160],
+                    "url": item.get("url", ""),
+                    "source_tier": item.get("_source_tier", ""),
+                    "quality_score": item.get("_quality_score"),
+                })
+        for paper in result.get("papers", []) or []:
+            if isinstance(paper, dict):
+                items.append({
+                    "title": str(paper.get("title", ""))[:160],
+                    "url": paper.get("url", "") or paper.get("pdf_url", ""),
+                    "source_tier": "academic",
+                    "citation_count": paper.get("citation_count"),
+                })
+        return {
+            "source": result.get("source", ""),
+            "total": result.get("total"),
+            "items": items[:5],
+        }
 
     def _trace_tool_result(self, task: SubTask, turn: int, tool_name: str, result) -> None:
         if not self.trace_recorder:
