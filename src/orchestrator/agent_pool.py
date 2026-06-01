@@ -163,6 +163,7 @@ class AgentPool:
                 max_turns=tool_loop_config.max_turns,
                 pool_type_key=type_key,
                 loop_config=tool_loop_config,
+                external_prefetch_config=researcher_cfg.get("external_prefetch", {}),
                 trace_recorder=self.trace_recorder,
             )
 

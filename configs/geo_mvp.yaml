@@ -58,6 +58,12 @@ planner:
 
 agents:
   researcher:
+    external_prefetch:
+      enabled: false
+      web_search_top_n: 3
+      paper_search_top_n: 3
+      timeout_seconds: 15
+      max_chars_per_item: 500
     tool_loop:
       max_turns: 10
       max_tool_calls_before_summary: 2
