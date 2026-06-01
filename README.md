@@ -142,6 +142,37 @@ DEEPSEEK_MODEL=deepseek-v4-flash
 
 M6 之后，推荐把“API 服务商”和“模块使用的模型配置”分开写：
 
+```text
+model.providers
+  deepseek / openai / vllm / mimo
+  - adapter
+  - env_prefix
+  - base_url
+  - api_key from env
+  - default_model
+        |
+        v
+model.profiles
+  planner / solver / summarizer / compressor
+  - provider
+  - model
+  - temperature
+  - top_p
+  - max_tokens
+        |
+        v
+model.module_profiles
+  planner -> planner
+  solver -> solver
+  summarizer -> summarizer
+        |
+        v
+LLMModelFactory
+        |
+        v
+OpenAICompatiblePolicy
+```
+
 ```yaml
 model:
   default_profile: "solver"
@@ -168,6 +199,7 @@ model:
 - `providers`：封装 API 服务商、OpenAI-compatible adapter、env 前缀、默认模型和 base URL。
 - `profiles`：封装模型名、temperature、top_p、max_tokens 等调用参数。
 - `module_profiles`：决定 `planner / solver / summarizer / compressor` 分别使用哪个 profile。
+- `OpenAICompatiblePolicy`：只负责一次 OpenAI-compatible LLM 调用；旧名 `VLLMPolicy` 仍作为兼容别名保留。
 - 旧的 `backend / backend_sampling / backend_mapping` 仍兼容，但新配置优先使用上述命名。
 
 ## M7 外部证据工具

@@ -16,13 +16,14 @@ from typing import Any
 
 from ..utils.env_config import ensure_env_loaded, get_env
 from .model_factory import LLMModelFactory
-from .vllm_policy import VLLMPolicy
+from .policy_adapter import PolicyAdapter
+from .vllm_policy import OpenAICompatiblePolicy
 
 
 __all__ = ["ModelRouter"]
 
 
-_BACKEND_CACHE: dict[str, VLLMPolicy] = {}
+_BACKEND_CACHE: dict[str, PolicyAdapter] = {}
 
 
 class ModelRouter:
@@ -33,7 +34,7 @@ class ModelRouter:
         backend_name: str | None = None,
         use_cache: bool = True,
         **override_kwargs: Any,
-    ) -> VLLMPolicy:
+    ) -> PolicyAdapter:
         """Create a policy for a legacy backend/provider name.
 
         Prefer ``LLMModelFactory.create_policy()`` for new code.  This method is
@@ -77,13 +78,13 @@ class ModelRouter:
             if cache_key in _BACKEND_CACHE:
                 return _BACKEND_CACHE[cache_key]
 
-        policy = VLLMPolicy(**kwargs)
+        policy = OpenAICompatiblePolicy(**kwargs)
         if cache_key is not None:
             _BACKEND_CACHE[cache_key] = policy
         return policy
 
     @staticmethod
-    def get_all_backends(backend_names: list[str] | None = None) -> dict[str, VLLMPolicy]:
+    def get_all_backends(backend_names: list[str] | None = None) -> dict[str, PolicyAdapter]:
         """Return configured providers using the legacy method name."""
         ensure_env_loaded()
         if backend_names is None:
@@ -94,7 +95,7 @@ class ModelRouter:
                     if prefix not in backend_names:
                         backend_names.append(prefix)
 
-        backends: dict[str, VLLMPolicy] = {}
+        backends: dict[str, PolicyAdapter] = {}
         for name in backend_names:
             if not ModelRouter._is_backend_configured(name):
                 continue

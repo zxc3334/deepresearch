@@ -1,11 +1,11 @@
-"""
-VLLM Policy — OpenAI API 封装
+"""OpenAI-compatible chat policy.
 
-直接复用项目一实现，增加 from __future__ import annotations 以保持 Python 3.10+ 兼容性。
-接口保持完全一致：
-  - __call__(messages) -> OpenAICompatibleDict
-  - set_tools(tools)
-  - _truncate_messages(messages, max_chars)
+This policy talks to any provider that exposes the OpenAI Chat Completions API
+shape, including vLLM, OpenAI, DeepSeek, Mimo, OpenRouter-compatible services,
+and local OpenAI-compatible gateways.
+
+``VLLMPolicy`` is kept as a backward-compatible alias because older modules and
+docs still import that name.
 """
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from openai import OpenAI
 from ..observability import normalize_usage
 
 
-__all__ = ["VLLMPolicy", "OpenAICompatibleDict"]
+__all__ = ["OpenAICompatiblePolicy", "VLLMPolicy", "OpenAICompatibleDict"]
 
 
 # 正则表达式：用于抠出 Qwen 在标签外输出废话时的工具指令
@@ -36,8 +36,8 @@ class OpenAICompatibleDict(dict):
         self.__dict__ = self
 
 
-class VLLMPolicy:
-    """VLLM Policy：封装 OpenAI 兼容 API（vLLM / OpenAI）。
+class OpenAICompatiblePolicy:
+    """Policy for one stateless OpenAI-compatible chat completion call.
 
     核心能力:
       - 消息格式清洗与合并（防止 vLLM 400）
@@ -265,3 +265,6 @@ class VLLMPolicy:
                 tool_calls=[],
                 usage=normalize_usage(None),
             )
+
+
+VLLMPolicy = OpenAICompatiblePolicy

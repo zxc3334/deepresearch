@@ -18,7 +18,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..utils.env_config import ensure_env_loaded, get_env
-from .vllm_policy import VLLMPolicy
+from .policy_adapter import PolicyAdapter
+from .vllm_policy import OpenAICompatiblePolicy
 
 
 __all__ = [
@@ -26,6 +27,7 @@ __all__ = [
     "LLMProfileConfig",
     "ResolvedModelConfig",
     "LLMModelFactory",
+    "PolicyAdapter",
 ]
 
 
@@ -131,6 +133,10 @@ class ResolvedModelConfig:
 class LLMModelFactory:
     """Create policies from provider/profile/module config."""
 
+    ADAPTERS = {
+        "openai_compatible": OpenAICompatiblePolicy,
+    }
+
     def __init__(self, model_config: dict[str, Any] | None = None) -> None:
         ensure_env_loaded()
         self.model_config = model_config or {}
@@ -145,14 +151,14 @@ class LLMModelFactory:
         )
         if self.default_profile not in self.profiles:
             self.default_profile = "default"
-        self._cache: dict[str, VLLMPolicy] = {}
+        self._cache: dict[str, PolicyAdapter] = {}
 
     def create_policy(
         self,
         module_name: str = "default",
         use_cache: bool = True,
         **overrides: Any,
-    ) -> VLLMPolicy:
+    ) -> PolicyAdapter:
         resolved = self.resolve(module_name, overrides=overrides)
         kwargs = resolved.to_policy_kwargs()
 
@@ -162,7 +168,8 @@ class LLMModelFactory:
             if cache_key in self._cache:
                 return self._cache[cache_key]
 
-        policy = VLLMPolicy(**kwargs)
+        policy_cls = self._policy_class_for(resolved.provider.adapter)
+        policy = policy_cls(**kwargs)
         if cache_key is not None:
             self._cache[cache_key] = policy
         return policy
@@ -388,6 +395,13 @@ class LLMModelFactory:
             "kwargs": {k: v for k, v in kwargs.items() if k != "api_key"},
         }
         return json.dumps(payload, sort_keys=True, default=str)
+
+    def _policy_class_for(self, adapter: str):
+        try:
+            return self.ADAPTERS[adapter]
+        except KeyError as exc:
+            supported = ", ".join(sorted(self.ADAPTERS))
+            raise ValueError(f"Unsupported policy adapter '{adapter}'. Supported adapters: {supported}") from exc
 
     def _default_provider_name(self) -> str:
         if self.model_config.get("backend"):
