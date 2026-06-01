@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..orchestrator.schemas import AgentResult, AgentStatus, SubTask
+from .tool_context import ContextBudgetManager, ToolResultCompactPolicy, ToolResultNormalizer
 from .tool_registry import ToolRegistry
 
 
@@ -26,6 +27,7 @@ class ToolLoopConfig:
     compact_threshold_ratio: float = 0.70
     compact_tool_result_chars: int = 4000
     chars_per_token: float = 3.5
+    head_tail_ratio: float = 0.70
 
 
 class ToolCallingLoop:
@@ -45,6 +47,17 @@ class ToolCallingLoop:
         self.messages: list[dict] = []
         self.trajectory: list[dict] = []
         self.total_tokens: int = 0
+        self.tool_result_normalizer = ToolResultNormalizer()
+        self.context_budget_manager = ContextBudgetManager(
+            budget_tokens=self.config.context_budget_tokens,
+            compact_trigger_ratio=self.config.compact_threshold_ratio,
+            chars_per_token=self.config.chars_per_token,
+        )
+        self.tool_compact_policy = ToolResultCompactPolicy(
+            max_chars=self.config.compact_tool_result_chars,
+            head_ratio=self.config.head_tail_ratio,
+            budget_manager=self.context_budget_manager,
+        )
 
     async def run(self, task: SubTask, system_prompt: str, user_prompt: str) -> AgentResult:
         """Execute the tool-calling loop for one task."""
@@ -277,7 +290,7 @@ class ToolCallingLoop:
         self.messages.append(assistant_msg)
 
         for tr in tool_results:
-            msg_content = json.dumps(tr["result"], ensure_ascii=False, default=str)
+            msg_content = self.tool_result_normalizer.dumps(tr["result"])
             msg_content = self._maybe_compact_tool_content(msg_content, tr["name"])
             if force_summary:
                 msg_content += "\n\n[SYSTEM NOTICE] You have already searched enough. Write your final summary NOW. Do NOT call any more tools."
@@ -293,36 +306,27 @@ class ToolCallingLoop:
         Error text is never compacted; preserving failure details is more important
         than saving context.
         """
-        if self._looks_like_error_content(content):
-            return content
+        current_chars = self._messages_chars(self.messages)
+        decision = self.tool_compact_policy.compact(content, current_context_chars=current_chars)
+        if not decision.compacted:
+            return decision.content
 
-        projected_chars = self._messages_chars(self.messages) + len(content)
-        threshold_chars = int(
-            self.config.context_budget_tokens
-            * self.config.chars_per_token
-            * self.config.compact_threshold_ratio
-        )
-        if projected_chars <= threshold_chars:
-            return content
-        if len(content) <= self.config.compact_tool_result_chars:
-            return content
-
-        compacted = self._head_tail_compact(content, self.config.compact_tool_result_chars)
         print(
-            f"[compact] tool={tool_name} chars={len(content)}->{len(compacted)} "
-            f"projected={projected_chars}/{threshold_chars}"
+            f"[compact] tool={tool_name} chars={decision.before_chars}->{decision.after_chars} "
+            f"projected={current_chars + decision.before_chars}/{decision.threshold_chars}"
         )
         if self.trace_recorder:
             self.trace_recorder.record(
                 "compact",
                 scope="tool_result",
                 tool=tool_name,
-                before_chars=len(content),
-                after_chars=len(compacted),
-                threshold_chars=threshold_chars,
-                strategy="head_tail_70_30",
+                before_chars=decision.before_chars,
+                after_chars=decision.after_chars,
+                threshold_chars=decision.threshold_chars,
+                strategy=decision.strategy,
+                reason=decision.reason,
             )
-        return compacted
+        return decision.content
 
     def _messages_chars(self, messages: list[dict]) -> int:
         total = 0
@@ -333,29 +337,6 @@ class ToolCallingLoop:
             if message.get("tool_calls"):
                 total += len(json.dumps(message.get("tool_calls"), ensure_ascii=False, default=str))
         return total
-
-    def _head_tail_compact(self, text: str, max_chars: int, head_ratio: float = 0.70) -> str:
-        head_chars = max(1, int(max_chars * head_ratio))
-        tail_chars = max(1, max_chars - head_chars)
-        omitted = max(0, len(text) - head_chars - tail_chars)
-        return (
-            f"{text[:head_chars].rstrip()}\n"
-            f"[compact] omitted {omitted} chars from middle of tool result; preserved head/tail 70/30.\n"
-            f"{text[-tail_chars:].lstrip()}"
-        )
-
-    def _looks_like_error_content(self, content: str) -> bool:
-        text = (content or "").lower()
-        return any(marker in text for marker in (
-            '"error"',
-            "error:",
-            "failed",
-            "traceback",
-            "exception",
-            "connection error",
-            "request timed out",
-            "api key",
-        ))
 
     def _maybe_force_tool_use(self, turn: int, fallback_tool: str) -> None:
         if turn > 0 and self.messages and self.messages[-1].get("role") == "assistant":

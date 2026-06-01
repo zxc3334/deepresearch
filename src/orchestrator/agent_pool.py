@@ -149,8 +149,12 @@ class AgentPool:
             max_tool_calls_before_summary=loop_cfg.get("max_tool_calls_before_summary", 2),
             context_budget_tokens=loop_cfg.get("context_budget_tokens", 12000),
             compact_threshold_ratio=loop_cfg.get("compact_threshold_ratio", 0.70),
-            compact_tool_result_chars=loop_cfg.get("compact_tool_result_chars", 4000),
+            compact_tool_result_chars=loop_cfg.get(
+                "tool_result_budget_chars",
+                loop_cfg.get("compact_tool_result_chars", 4000),
+            ),
             chars_per_token=loop_cfg.get("chars_per_token", 3.5),
+            head_tail_ratio=loop_cfg.get("head_tail_ratio", 0.70),
         )
         summarizer_cfg = self.agent_config.get("summarizer", {})
         summarizer_compact_cfg = summarizer_cfg.get("compact", {})

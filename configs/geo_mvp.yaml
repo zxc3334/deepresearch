@@ -70,6 +70,9 @@ agents:
       context_budget_tokens: 12000
       compact_threshold_ratio: 0.70
       compact_tool_result_chars: 4000
+      tool_result_budget_chars: 4000
+      synthesis_context_budget_tokens: 24000
+      head_tail_ratio: 0.70
       chars_per_token: 3.5
   summarizer:
     compact:
