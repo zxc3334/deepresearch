@@ -149,6 +149,8 @@ memory:
   # M4: Shared Memory Store 配置
   # SQLite 数据库文件路径
   db_path: "data/memory.db"
+  # 是否在当前 user/session 记忆之外读取全局记忆
+  include_global: true
   # 内存表中最大条目数，超过则触发淘汰
   max_entries: 10000
   # 去重相似度阈值：高于此值视为重复记忆，不重复写入

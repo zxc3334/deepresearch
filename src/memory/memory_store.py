@@ -111,6 +111,9 @@ class SharedMemoryStore:
         db_path: str = "memory.db",
         embedder: Optional[Embedder] = None,
         session_id: str = "",
+        user_id: str = "",
+        run_id: str = "",
+        include_global: bool = True,
     ) -> None:
         """
         初始化共享记忆存储。
@@ -119,11 +122,17 @@ class SharedMemoryStore:
             db_path: SQLite 数据库路径
             embedder: 向量化器，None 时自动创建
             session_id: 会话 ID，空字符串表示加载所有历史数据（不隔离）
+            user_id: 用户 ID，用于多用户记忆隔离
+            run_id: 当前运行 ID，会写入 metadata 便于追踪
+            include_global: 是否读取 session_id 为空的全局记忆
         """
         self.lt = LongTermMemory(db_path=db_path)
         self.embedder = embedder or Embedder()
         self._lock = threading.RLock()
         self.session_id = session_id
+        self.user_id = user_id
+        self.run_id = run_id
+        self.include_global = include_global
 
         # 内存向量索引
         self._entry_ids: list[str] = []
@@ -138,8 +147,11 @@ class SharedMemoryStore:
     # ------------------------------------------------------------------
 
     def _rebuild_index(self) -> None:
-        """从 SQLite 重建内存向量索引。若指定了 session_id，只加载该会话数据。"""
-        entries = self.lt.get_all_entries(session_id=self.session_id or None)
+        """从 SQLite 重建内存向量索引，只加载当前 store 可见的记忆。"""
+        entries = [
+            entry for entry in self.lt.get_all_entries(session_id=None)
+            if self._is_entry_visible(entry)
+        ]
         with self._lock:
             self._entry_ids = [e.entry_id for e in entries]
             self._entries_cache = {e.entry_id: e for e in entries}
@@ -151,11 +163,78 @@ class SharedMemoryStore:
                 self._embeddings = mat / norms
             else:
                 self._embeddings = np.zeros((0, self.embedder.dim), dtype=np.float32)
-        scope = f"session={self.session_id}" if self.session_id else "all sessions"
+        scope = (
+            f"user={self.user_id or '*'}, session={self.session_id or '*'}, "
+            f"include_global={self.include_global}"
+        )
         logger.info(f"Memory index rebuilt: {len(entries)} entries loaded ({scope}).")
+
+    def _entry_user_id(self, entry: MemoryEntry) -> str:
+        return str(entry.metadata.get("user_id", "") or "")
+
+    def _is_entry_visible(
+        self,
+        entry: MemoryEntry,
+        *,
+        user_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        include_global: Optional[bool] = None,
+    ) -> bool:
+        """判断一条记忆对当前查询范围是否可见。
+
+        可见性分三层：
+        - global: session_id 为空且 user_id 为空，所有 session 可读；
+        - user: session_id 为空且 user_id 匹配，同一用户不同 session 可读；
+        - session: session_id 匹配，只在当前会话内可读。
+        """
+        effective_user = self.user_id if user_id is None else user_id
+        effective_session = self.session_id if session_id is None else session_id
+        effective_include_global = self.include_global if include_global is None else include_global
+
+        entry_user = self._entry_user_id(entry)
+        entry_session = entry.session_id or ""
+
+        if not effective_user and not effective_session:
+            return True
+
+        if not entry_session:
+            if not entry_user:
+                return bool(effective_include_global)
+            return bool(effective_user and entry_user == effective_user)
+
+        if effective_session and entry_session == effective_session:
+            return not effective_user or not entry_user or entry_user == effective_user
+
+        return False
+
+    def _prepare_entry_scope(self, entry: MemoryEntry) -> None:
+        """写入前补齐 user/session/run/task 元数据，并确定持久化 session_id。"""
+        metadata = dict(entry.metadata or {})
+        scope = str(metadata.get("scope") or ("session" if self.session_id else "global")).lower()
+
+        if scope == "global":
+            entry.session_id = ""
+            metadata["user_id"] = ""
+            metadata["session_id"] = ""
+        elif scope == "user":
+            entry.session_id = ""
+            metadata["user_id"] = self.user_id
+            metadata["session_id"] = ""
+        else:
+            entry.session_id = entry.session_id or self.session_id
+            metadata["user_id"] = self.user_id
+            metadata["session_id"] = entry.session_id
+            scope = "session"
+
+        metadata["run_id"] = self.run_id
+        metadata.setdefault("task_id", entry.agent_id)
+        metadata["scope"] = scope
+        entry.metadata = metadata
 
     def _add_to_index(self, entry: MemoryEntry) -> None:
         """将单条 entry 追加到内存索引。"""
+        if not self._is_entry_visible(entry):
+            return
         vec = np.array(entry.embedding, dtype=np.float32)
         norm = float(np.linalg.norm(vec))
         if norm > 1e-9:
@@ -250,8 +329,8 @@ class SharedMemoryStore:
                 logger.info(f"Duplicate detected, kept existing {duplicate_id}.")
             return duplicate_id
 
-        # 写入 session_id 并持久化
-        entry.session_id = self.session_id
+        # 写入 scope metadata 并持久化
+        self._prepare_entry_scope(entry)
         self.lt.insert_entry(entry)
         self._add_to_index(entry)
 
@@ -326,7 +405,13 @@ class SharedMemoryStore:
 
     @trace_retriever(name="memory.query", tags=["m4", "memory"])
     def query_by_similarity(
-        self, query: str, top_k: int = 5, min_sim: float = 0.50
+        self,
+        query: str,
+        top_k: int = 5,
+        min_sim: float = 0.50,
+        user_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        include_global: Optional[bool] = None,
     ) -> list[tuple[MemoryEntry, float]]:
         """
         按 query 语义相似度搜索记忆，带相关性门槛过滤。
@@ -335,6 +420,9 @@ class SharedMemoryStore:
             query: 查询文本
             top_k: 返回条数上限
             min_sim: 最小相似度门槛，低于此值的记忆视为不相关
+            user_id: 可选用户过滤，不传时使用 store 默认 user_id
+            session_id: 可选会话过滤，不传时使用 store 默认 session_id
+            include_global: 是否包含全局记忆，不传时使用 store 默认配置
 
         Returns:
             (MemoryEntry, similarity) 列表（按相似度降序）
@@ -348,7 +436,7 @@ class SharedMemoryStore:
         q_vec = q_vec / norm
         with self._lock:
             sims = self._embeddings.dot(q_vec)
-        top_indices = np.argsort(sims)[::-1][:top_k]
+        top_indices = np.argsort(sims)[::-1]
         results = []
         for idx in top_indices:
             sim = float(sims[int(idx)])
@@ -356,8 +444,15 @@ class SharedMemoryStore:
                 continue
             entry_id = self._entry_ids[int(idx)]
             entry = self._entries_cache.get(entry_id)
-            if entry:
+            if entry and self._is_entry_visible(
+                entry,
+                user_id=user_id,
+                session_id=session_id,
+                include_global=include_global,
+            ):
                 results.append((entry, sim))
+                if len(results) >= top_k:
+                    break
         return results
 
     def query_by_topic(self, topic: str) -> list[MemoryEntry]:
@@ -530,7 +625,14 @@ class SharedMemoryStore:
                 logger.info(f"Evicted entry {entry_id} (score={score:.4f}).")
         return removed
 
-    def get_context_for_query(self, query: str, max_tokens: int = 4000) -> str:
+    def get_context_for_query(
+        self,
+        query: str,
+        max_tokens: int = 4000,
+        user_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        include_global: Optional[bool] = None,
+    ) -> str:
         """
         为 Agent 组装与 query 相关的记忆上下文文本。
 
@@ -543,13 +645,23 @@ class SharedMemoryStore:
         Args:
             query: 当前查询
             max_tokens: token 预算上限
+            user_id: 可选用户过滤，不传时使用 store 默认 user_id
+            session_id: 可选会话过滤，不传时使用 store 默认 session_id
+            include_global: 是否包含全局记忆，不传时使用 store 默认配置
 
         Returns:
             组装好的上下文文本（空字符串表示无相关记忆）
         """
         import time
 
-        entries_with_sim = self.query_by_similarity(query, top_k=10, min_sim=0.55)
+        entries_with_sim = self.query_by_similarity(
+            query,
+            top_k=10,
+            min_sim=0.55,
+            user_id=user_id,
+            session_id=session_id,
+            include_global=include_global,
+        )
         if not entries_with_sim:
             return ""
 
@@ -573,10 +685,11 @@ class SharedMemoryStore:
         parts.append(header)
 
         for entry, sim in entries_with_sim:
+            scope = entry.metadata.get("scope", "session")
             block = (
                 f"- [{entry.topic}] {entry.claim}\n"
                 f"  来源: {entry.source} | 置信度: {entry.confidence:.2f} | "
-                f"证据类型: {entry.evidence_type} | 相关度: {sim:.2f}\n"
+                f"证据类型: {entry.evidence_type} | 范围: {scope} | 相关度: {sim:.2f}\n"
             )
             if current_chars + len(block) > max_chars:
                 break

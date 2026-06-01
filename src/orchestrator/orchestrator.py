@@ -212,9 +212,15 @@ class Orchestrator:
                         embedding=[],
                         topic=query[:50],
                         metadata={
+                            "user_id": getattr(self.memory_store, "user_id", ""),
+                            "session_id": getattr(self.memory_store, "session_id", ""),
+                            "run_id": getattr(self.memory_store, "run_id", ""),
+                            "task_id": "final_report",
+                            "scope": "session",
                             "num_searches": report.num_searches,
                             "num_replan": report.num_replan,
                             "adversarial_rounds": report.adversarial_rounds,
+                            "evidence_summary": getattr(report, "evidence_summary", {}),
                         },
                     )
                     self.memory_store.put(entry)
@@ -431,6 +437,8 @@ class Orchestrator:
             for r in self._results:
                 if r.status == AgentStatus.SUCCESS and r.output:
                     self._sync_result_to_memory_store(r)
+                elif r.status in (AgentStatus.FAILED, AgentStatus.TIMEOUT):
+                    self._sync_failure_to_memory_store(r)
 
         success_count = sum(1 for r in self._results if r.status == AgentStatus.SUCCESS)
         total_count = len(self._results)
@@ -479,6 +487,11 @@ class Orchestrator:
                 embedding=[],  # SharedMemoryStore.put() 会自动生成 embedding
                 topic=self._query[:50],
                 metadata={
+                    "user_id": getattr(self.memory_store, "user_id", ""),
+                    "session_id": getattr(self.memory_store, "session_id", ""),
+                    "run_id": getattr(self.memory_store, "run_id", ""),
+                    "task_id": result.task_id,
+                    "scope": "session",
                     "status": result.status.value,
                     "token_usage": getattr(result, "token_usage", 0),
                     "evidence_items": [item.to_dict() for item in evidence_items],
@@ -492,6 +505,46 @@ class Orchestrator:
             print(f"[M4] Memory stored: {result.task_id} (evidence={level}, claim={claim_text[:60]}...)")
         except Exception as e:
             print(f"[M4] Failed to store memory for {result.task_id}: {e}")
+
+    def _sync_failure_to_memory_store(self, result: AgentResult) -> None:
+        """将失败/超时任务以精简约束形式写入长期记忆。"""
+        try:
+            from src.memory.long_term import MemoryEntry
+
+            task = self._task_map.get(result.task_id)
+            description = task.description if task else result.task_id
+            output_summary = str(result.output or "")[:400]
+            claim_text = (
+                f"Failure memory for task {result.task_id}: {description}. "
+                f"Status={result.status.value}. Error or constraint summary: {output_summary}"
+            )
+            entry = MemoryEntry(
+                entry_id=f"failure:{result.task_id}:{int(time.time())}",
+                claim=claim_text,
+                source=f"task:{result.task_id}",
+                confidence=max(float(getattr(result, "confidence", 0.0) or 0.0), 0.45),
+                agent_id=result.task_id,
+                timestamp=time.time(),
+                evidence_type="inference",
+                embedding=[],
+                topic=self._query[:50],
+                metadata={
+                    "user_id": getattr(self.memory_store, "user_id", ""),
+                    "session_id": getattr(self.memory_store, "session_id", ""),
+                    "run_id": getattr(self.memory_store, "run_id", ""),
+                    "task_id": result.task_id,
+                    "scope": "session",
+                    "status": result.status.value,
+                    "failure_memory": True,
+                    "evidence_level": "rejected",
+                    "source_tier": "general",
+                    "token_usage": getattr(result, "token_usage", 0),
+                },
+            )
+            self.memory_store.put(entry)
+            print(f"[M4] Failure memory stored: {result.task_id} ({result.status.value})")
+        except Exception as e:
+            print(f"[M4] Failed to store failure memory for {result.task_id}: {e}")
 
     async def _do_synthesizing(self) -> OrchestratorState:
         """调用 SummarizerAgent 合成研究报告。"""

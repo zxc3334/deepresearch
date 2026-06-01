@@ -93,6 +93,7 @@ compressor:
 
 memory:
   db_path: "data/geo_real_search_memory.db"
+  include_global: true
   max_entries: 1000
   similarity_threshold_dup: 0.92
   similarity_threshold_conflict: 0.65

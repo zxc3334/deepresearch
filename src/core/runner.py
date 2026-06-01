@@ -150,13 +150,20 @@ def _create_tools_factory(config: dict):
 # ---------------------------------------------------------------------------
 # 模块初始化
 # ---------------------------------------------------------------------------
-def initialize_modules(config: dict, session_id: str = "") -> dict[str, Any]:
+def initialize_modules(
+    config: dict,
+    session_id: str = "",
+    user_id: str = "",
+    run_id: str = "",
+) -> dict[str, Any]:
     """
     根据配置初始化所有核心模块。
 
     Args:
         config: 全局配置字典。
         session_id: 会话 ID，用于 memory store 的 session 隔离。
+        user_id: 用户 ID，用于长期记忆多用户隔离。
+        run_id: 运行 ID，用于 trace/memory metadata 追踪。
 
     返回一个包含各模块实例的字典。
     """
@@ -164,12 +171,20 @@ def initialize_modules(config: dict, session_id: str = "") -> dict[str, Any]:
     logger.info("正在初始化核心模块...")
 
     modules: dict[str, Any] = {}
+    user_id = user_id or str(config.get("_user_id", "") or "")
+    session_id = session_id or str(config.get("_session_id", "") or "")
+    run_id = run_id or str(config.get("_run_id", "") or session_id or "")
     trace_path = config.get("_trace_path")
     trace_recorder = None
     if trace_path:
         from src.observability import TraceRecorder
-        trace_recorder = TraceRecorder(trace_path, run_id=session_id or None)
-        trace_recorder.record("modules_init_start", session_id=session_id)
+        trace_recorder = TraceRecorder(trace_path, run_id=run_id or None)
+        trace_recorder.record(
+            "modules_init_start",
+            user_id=user_id,
+            session_id=session_id,
+            run_id=run_id,
+        )
     modules["trace_recorder"] = trace_recorder
 
     # ------------------------------------------------------------------
@@ -245,9 +260,15 @@ def initialize_modules(config: dict, session_id: str = "") -> dict[str, Any]:
     memory_store = SharedMemoryStore(
         db_path=memory_cfg.get("db_path", "data/memory.db"),
         session_id=session_id,
+        user_id=user_id,
+        run_id=run_id,
+        include_global=memory_cfg.get("include_global", True),
     )
     modules["memory_store"] = memory_store
-    logger.info(f"[M4] Memory Store 模块已初始化 (session={session_id})")
+    logger.info(
+        f"[M4] Memory Store 模块已初始化 "
+        f"(user={user_id or '*'}, session={session_id or '*'}, run={run_id or '*'})"
+    )
 
     # Tools（真实工具或 Mock 工具）
     tools_list = _create_tools_factory(config)
