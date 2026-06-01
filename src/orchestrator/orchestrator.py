@@ -375,6 +375,8 @@ class Orchestrator:
                         "evidence_item",
                         task_id=r.task_id,
                         level=item.level.value,
+                        source_tier=item.source_tier.value,
+                        source_count=item.source_count,
                         claim=item.claim,
                         source=item.source,
                         rationale=item.rationale,
@@ -440,6 +442,8 @@ class Orchestrator:
                     "token_usage": getattr(result, "token_usage", 0),
                     "evidence_items": [item.to_dict() for item in evidence_items],
                     "evidence_level": primary_evidence.level.value if primary_evidence else "",
+                    "source_tier": primary_evidence.source_tier.value if primary_evidence else "",
+                    "source_count": primary_evidence.source_count if primary_evidence else 0,
                 },
             )
             self.memory_store.put(entry)

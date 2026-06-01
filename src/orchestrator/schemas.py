@@ -16,6 +16,7 @@ __all__ = [
     "TaskType",
     "AgentStatus",
     "EvidenceLevel",
+    "SourceTier",
     "EvidenceItem",
     "SubTask",
     "AgentResult",
@@ -82,6 +83,15 @@ class EvidenceLevel(Enum):
     REJECTED = "rejected"
 
 
+class SourceTier(Enum):
+    """Source quality tier, independent from claim verification status."""
+    OFFICIAL = "official"
+    ACADEMIC = "academic"
+    AUTHORITATIVE = "authoritative"
+    GENERAL = "general"
+    UNVERIFIED = "unverified"
+
+
 # ============================================================================
 # 数据类定义
 # ============================================================================
@@ -101,10 +111,12 @@ class EvidenceItem:
     """
     claim: str
     level: EvidenceLevel
+    source_tier: SourceTier = SourceTier.UNVERIFIED
     source: str = ""
     rationale: str = ""
     task_id: str = ""
     confidence: float = 0.0
+    source_count: int = 0
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -112,10 +124,12 @@ class EvidenceItem:
         return {
             "claim": self.claim,
             "level": self.level.value,
+            "source_tier": self.source_tier.value,
             "source": self.source,
             "rationale": self.rationale,
             "task_id": self.task_id,
             "confidence": self.confidence,
+            "source_count": self.source_count,
             "metadata": self.metadata,
         }
 
