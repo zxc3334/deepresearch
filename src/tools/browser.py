@@ -25,6 +25,8 @@ from typing import Any
 
 import aiohttp
 
+from ..utils.text_cleanup import normalize_extracted_text
+
 
 __all__ = ["BrowserTool", "MockBrowserTool"]
 
@@ -190,12 +192,12 @@ class BrowserTool(BaseBrowserTool):
     def _clean_text(text: str) -> str:
         """清理提取后的文本。"""
         # 合并多余换行
-        text = re.sub(r"\n\s*\n+", "\n\n", text)
+        text = normalize_extracted_text(text)
         # 去除每行首尾空白
         lines = [line.strip() for line in text.splitlines()]
         # 过滤空行和过短行（通常是导航项）
         lines = [line for line in lines if len(line) > 3]
-        return "\n".join(lines)
+        return normalize_extracted_text("\n".join(lines))
 
 
 class MockBrowserTool(BaseBrowserTool):

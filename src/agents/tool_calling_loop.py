@@ -28,6 +28,11 @@ class ToolLoopConfig:
     compact_tool_result_chars: int = 4000
     chars_per_token: float = 3.5
     head_tail_ratio: float = 0.70
+    auto_fetch_official_docs: bool = True
+    auto_fetch_official_max_urls: int = 1
+    auto_fetch_official_timeout_seconds: float = 12.0
+    auto_fetch_official_max_chars: int = 6000
+    auto_fetch_official_max_snippets: int = 3
 
 
 class ToolCallingLoop:
@@ -220,6 +225,14 @@ class ToolCallingLoop:
                     confidence=0.0,
                 )
 
+            extra_trajectory = await self._maybe_auto_fetch_official_docs(
+                task=task,
+                turn=turn,
+                source_tool_name=tool_name,
+                source_args=args,
+                source_result=result,
+            )
+
             tool_result = {
                 "tool_call_id": tc.get("id", ""),
                 "name": tool_name,
@@ -242,8 +255,140 @@ class ToolCallingLoop:
                 "name": tool_name,
                 "result": result,
             })
+            self.trajectory.extend(extra_trajectory)
 
         return tool_results
+
+    async def _maybe_auto_fetch_official_docs(
+        self,
+        task: SubTask,
+        turn: int,
+        source_tool_name: str,
+        source_args: dict[str, Any],
+        source_result: Any,
+    ) -> list[dict[str, Any]]:
+        """Upgrade official search hits into page-grounded official evidence.
+
+        The fetched pages are merged into the official search result so the next
+        LLM turn can use the snippets without needing another tool choice. They
+        are also recorded as synthetic trajectory/trace tool events so
+        EvidenceStore can classify them as official_doc_fetcher evidence.
+        """
+        if not self.config.auto_fetch_official_docs:
+            return []
+        if source_tool_name != "official_source_search":
+            return []
+        if "official_doc_fetcher" not in self.tool_registry.tool_map:
+            return []
+        if not isinstance(source_result, dict):
+            return []
+
+        urls = self._official_search_urls(source_result)
+        max_urls = max(0, int(self.config.auto_fetch_official_max_urls))
+        if not urls or max_urls <= 0:
+            return []
+
+        query = str(source_args.get("query") or source_result.get("query") or task.description or "")
+        selected_urls = urls[:max_urls]
+        fetched_documents: list[dict[str, Any]] = []
+        extra_trajectory: list[dict[str, Any]] = []
+
+        if self.trace_recorder:
+            self.trace_recorder.record(
+                "official_auto_fetch_start",
+                task_id=task.task_id,
+                turn=turn,
+                urls=selected_urls,
+                query=query,
+            )
+
+        for index, url in enumerate(selected_urls):
+            fetch_args = {
+                "url": url,
+                "query": query,
+                "max_chars": int(self.config.auto_fetch_official_max_chars),
+                "max_snippets": int(self.config.auto_fetch_official_max_snippets),
+            }
+            if self.trace_recorder:
+                self.trace_recorder.record(
+                    "tool_call",
+                    task_id=task.task_id,
+                    turn=turn,
+                    tool="official_doc_fetcher",
+                    args={**fetch_args, "auto_fetch": True},
+                )
+            try:
+                fetched = await asyncio.wait_for(
+                    self.tool_registry.execute("official_doc_fetcher", fetch_args),
+                    timeout=float(self.config.auto_fetch_official_timeout_seconds),
+                )
+            except Exception as exc:
+                fetched = {"error": f"{type(exc).__name__}: {exc}", "url": url}
+
+            if isinstance(fetched, dict) and fetched.get("error"):
+                error_msg = str(fetched.get("error", ""))
+                if self.trace_recorder:
+                    self.trace_recorder.record(
+                        "tool_result",
+                        task_id=task.task_id,
+                        turn=turn,
+                        tool="official_doc_fetcher",
+                        status="error",
+                        error=error_msg,
+                        auto_fetch=True,
+                        url=url,
+                    )
+                extra_trajectory.append({
+                    "turn": turn,
+                    "role": "tool",
+                    "tool_call_id": f"auto_official_doc_fetcher_{index}",
+                    "name": "official_doc_fetcher",
+                    "error": error_msg,
+                    "auto_fetch": True,
+                    "source_tool": source_tool_name,
+                    "url": url,
+                })
+                continue
+
+            if not isinstance(fetched, dict):
+                continue
+            fetched["auto_fetch"] = True
+            fetched["source_tool"] = source_tool_name
+            fetched_documents.append(fetched)
+            self._trace_tool_result(task, turn, "official_doc_fetcher", fetched)
+            extra_trajectory.append({
+                "turn": turn,
+                "role": "tool",
+                "tool_call_id": f"auto_official_doc_fetcher_{index}",
+                "name": "official_doc_fetcher",
+                "result": fetched,
+                "auto_fetch": True,
+                "source_tool": source_tool_name,
+            })
+
+        if fetched_documents:
+            source_result["auto_fetched_documents"] = fetched_documents
+            source_result["auto_fetched_total"] = len(fetched_documents)
+        if self.trace_recorder:
+            self.trace_recorder.record(
+                "official_auto_fetch_end",
+                task_id=task.task_id,
+                turn=turn,
+                requested=len(selected_urls),
+                fetched=len(fetched_documents),
+            )
+        return extra_trajectory
+
+    def _official_search_urls(self, result: dict[str, Any]) -> list[str]:
+        urls: list[str] = []
+        for item in result.get("results", []) or []:
+            if not isinstance(item, dict):
+                continue
+            url = str(item.get("url", "") or "").strip()
+            if not url or url in urls:
+                continue
+            urls.append(url)
+        return urls
 
     async def _publish_progress(self, event_type: str, **payload: Any) -> None:
         callback = self.progress_callback
@@ -305,10 +450,7 @@ class ToolCallingLoop:
             )
             return
 
-        urls = []
-        for item in result.get("results", []) or []:
-            if isinstance(item, dict) and item.get("url"):
-                urls.append(item["url"])
+        urls = self._extract_urls(result)
         self.trace_recorder.record(
             "tool_result",
             task_id=task.task_id,
@@ -327,10 +469,7 @@ class ToolCallingLoop:
             print(f"[ToolCall] task={task.task_id} turn={turn} tool={tool_name} args={args} result_type={type(result).__name__}")
             return
 
-        urls = []
-        for item in result.get("results", []) or []:
-            if isinstance(item, dict) and item.get("url"):
-                urls.append(str(item["url"]))
+        urls = self._extract_urls(result)
         if result.get("error"):
             print(f"[ToolCall] task={task.task_id} turn={turn} tool={tool_name} args={args} error={result['error']}")
             return
@@ -339,6 +478,19 @@ class ToolCallingLoop:
             f"[ToolCall] task={task.task_id} turn={turn} tool={tool_name} "
             f"total={result.get('total', 'n/a')} source={result.get('source', '')} urls={url_preview}"
         )
+
+    def _extract_urls(self, result: dict[str, Any]) -> list[str]:
+        urls: list[str] = []
+        for item in result.get("results", []) or []:
+            if isinstance(item, dict) and item.get("url"):
+                urls.append(str(item["url"]))
+        for paper in result.get("papers", []) or []:
+            if not isinstance(paper, dict):
+                continue
+            url = paper.get("url") or paper.get("pdf_url")
+            if url:
+                urls.append(str(url))
+        return urls
 
     def _append_assistant_and_tool_messages(
         self,

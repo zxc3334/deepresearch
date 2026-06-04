@@ -8,6 +8,7 @@ back to replanning.
 from __future__ import annotations
 
 from collections import Counter
+import re
 from typing import Any
 
 from ..orchestrator.schemas import AgentResult, AgentStatus, EvidenceItem, EvidenceLevel, SourceTier, SubTask, TaskType
@@ -16,6 +17,13 @@ from ..utils.domain_tiers import best_tier, classify_url, extract_hostname
 
 class EvidenceStore:
     """Classify agent outputs into evidence-aware claims."""
+
+    RELEVANCE_STOPWORDS = {
+        "and", "the", "for", "with", "from", "that", "this", "into", "using",
+        "use", "uses", "study", "research", "method", "methods", "analysis",
+        "remote", "sensing", "surface", "urban", "environment", "effect",
+        "effects", "impact", "impacts", "data", "dataset", "datasets",
+    }
 
     def annotate_result(self, result: AgentResult, task: SubTask | None = None) -> AgentResult:
         """Attach evidence items to an AgentResult and return it."""
@@ -27,7 +35,7 @@ class EvidenceStore:
     def build_evidence_items(self, result: AgentResult, task: SubTask | None = None) -> list[EvidenceItem]:
         """Build evidence items for one result.
 
-        Structured GIS/RS tools may emit multiple claim-level checks. Preserve
+        Structured evidence tools may emit multiple claim-level checks. Preserve
         those checks as separate evidence items so one invalid claim does not
         make every valid correction from the same task look rejected.
         """
@@ -300,11 +308,6 @@ class EvidenceStore:
             return "official_doc"
         if tool_name == "paper_search" or payload.get("source_type") == "academic_paper":
             return "academic_paper"
-        registry_type = payload.get("registry_type")
-        if registry_type == "geo_plan_validation" or str(source).startswith("geo-registry://"):
-            return "registry_heuristic"
-        if registry_type in ("dataset", "method"):
-            return "registry_curated_with_official_url" if self._is_external_url(source) else "registry_heuristic"
         return "structured_tool"
 
     def _cap_structured_level(
@@ -314,18 +317,9 @@ class EvidenceStore:
         payload: dict[str, Any],
         source: str = "",
     ) -> EvidenceLevel:
-        """Prevent local registries from promoting hints into verified evidence."""
+        """Keep structured tool evidence conservative unless backed by strong sources."""
         if level == EvidenceLevel.REJECTED:
             return EvidenceLevel.REJECTED
-
-        registry_type = payload.get("registry_type")
-        if registry_type == "geo_plan_validation" or str(source).startswith("geo-registry://"):
-            return EvidenceLevel.SPECULATIVE
-
-        if registry_type in ("dataset", "method"):
-            if self._is_external_url(source):
-                return EvidenceLevel.EVIDENCE_BACKED
-            return EvidenceLevel.SPECULATIVE
 
         if tool_name == "official_source_search" and level == EvidenceLevel.VERIFIED:
             return EvidenceLevel.EVIDENCE_BACKED
@@ -340,10 +334,15 @@ class EvidenceStore:
                 return EvidenceLevel.EVIDENCE_BACKED
             return level
 
+        if tool_name == "wiki_search" or payload.get("source_type") == "wiki":
+            if level == EvidenceLevel.VERIFIED:
+                return EvidenceLevel.EVIDENCE_BACKED
+            return level
+
         return level
 
     def _structured_evidence_items(self, result: AgentResult, task: SubTask | None = None) -> list[EvidenceItem]:
-        """Convert structured registry payloads into claim-level evidence items."""
+        """Convert structured tool payloads into claim-level evidence items."""
         items: list[EvidenceItem] = []
         task_type = task.task_type.value if task else ""
 
@@ -355,6 +354,38 @@ class EvidenceStore:
             if not isinstance(payload, dict):
                 continue
 
+            if (tool_name == "wiki_search" or payload.get("source_type") == "wiki") and isinstance(payload.get("results"), list):
+                raw_level = self._normalize_level(payload.get("evidence_level"))
+                for record in payload["results"]:
+                    if not isinstance(record, dict):
+                        continue
+                    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+                    page_level = self._normalize_level(metadata.get("evidence_level") or record.get("evidence_level") or raw_level.value)
+                    level = self._cap_structured_level(page_level, tool_name, payload, source=str(record.get("path", "")))
+                    source_tier = self._source_tier_from_value(metadata.get("source_tier") or record.get("source_tier"))
+                    items.append(EvidenceItem(
+                        claim=self._claim_from_output(
+                            str(record.get("snippet", "") or record.get("title", "") or "Wiki search result.")
+                        ),
+                        level=level,
+                        source_tier=source_tier,
+                        source=str(record.get("path", "") or ""),
+                        rationale="Retrieved from local wiki draft; important claims should still be checked against original sources.",
+                        task_id=result.task_id,
+                        confidence=result.confidence,
+                        source_count=0,
+                        metadata={
+                            "tool": tool_name,
+                            "task_type": task_type,
+                            "status": result.status.value,
+                            "source_type": "wiki",
+                            "title": record.get("title", ""),
+                            "score": record.get("score", 0),
+                            "wiki_metadata": metadata,
+                        },
+                    ))
+                continue
+
             if isinstance(payload.get("checks"), list):
                 source = self._source_for_structured_payload(tool_name, payload)
                 source_type = self._structured_source_type(tool_name, payload, source=source)
@@ -364,8 +395,6 @@ class EvidenceStore:
                     raw_level = self._normalize_level(check.get("level"))
                     level = self._cap_structured_level(raw_level, tool_name, payload, source=source)
                     rationale = str(check.get("reason", "") or "Structured GIS/remote-sensing validation check.")
-                    if source_type.startswith("registry_"):
-                        rationale = f"{rationale} Source type: {source_type}; external verification is required."
                     items.append(EvidenceItem(
                         claim=str(check.get("claim", "") or "Structured validation check"),
                         level=level,
@@ -380,7 +409,6 @@ class EvidenceStore:
                             "task_type": task_type,
                             "status": result.status.value,
                             "fix": check.get("fix", ""),
-                            "registry_type": payload.get("registry_type", ""),
                             "source_type": source_type,
                             "raw_evidence_level": raw_level.value,
                             "requires_external_verification": bool(payload.get("requires_external_verification", False)),
@@ -388,23 +416,28 @@ class EvidenceStore:
                     ))
                 continue
 
-            registry_type = payload.get("registry_type")
             if (tool_name == "official_doc_fetcher" or payload.get("source_type") == "official_doc") and isinstance(payload.get("results"), list):
                 raw_level = self._normalize_level(payload.get("evidence_level"))
                 for record in payload["results"]:
                     if not isinstance(record, dict):
                         continue
                     snippets = record.get("snippets") if isinstance(record.get("snippets"), list) else []
+                    claim_support = payload.get("claim_support")
+                    if not isinstance(claim_support, dict):
+                        claim_support = record.get("claim_support") if isinstance(record.get("claim_support"), dict) else {}
+                    support_level = str(claim_support.get("level", "") or "")
                     has_query_match = bool(payload.get("match_count", 0)) or any(
                         isinstance(snippet, dict) and snippet.get("match_score", 0) > 0
                         for snippet in snippets
                     )
                     source = record.get("url", "")
                     base_level = self._cap_structured_level(raw_level, tool_name, payload, source=source)
-                    if task and task.task_type in (TaskType.VERIFY, TaskType.GEO_VALIDATION) and has_query_match and result.confidence >= 0.7:
+                    if support_level == "unsupported":
+                        level = EvidenceLevel.SPECULATIVE
+                    elif task and task.task_type in (TaskType.VERIFY, TaskType.GEO_VALIDATION) and support_level == "supported" and result.confidence >= 0.7:
                         level = EvidenceLevel.VERIFIED
                     else:
-                        level = base_level if has_query_match else EvidenceLevel.SPECULATIVE
+                        level = base_level if has_query_match and support_level in ("supported", "weak_support", "") else EvidenceLevel.SPECULATIVE
                     if snippets:
                         claim = str(snippets[0].get("text", "") or record.get("snippet", "") or record.get("title", ""))
                     else:
@@ -415,9 +448,13 @@ class EvidenceStore:
                         source_tier=self.classify_source_tier(source),
                         source=source,
                         rationale=(
-                            "Fetched official documentation page and extracted query-matched snippets."
-                            if snippets else
-                            "Fetched official documentation page, but no query-matched snippet was found."
+                            str(claim_support.get("reason"))
+                            if claim_support else
+                            (
+                                "Fetched official documentation page and extracted query-matched snippets."
+                                if snippets else
+                                "Fetched official documentation page, but no query-matched snippet was found."
+                            )
                         ),
                         task_id=result.task_id,
                         confidence=result.confidence,
@@ -432,6 +469,7 @@ class EvidenceStore:
                             "content_chars": record.get("content_chars", 0),
                             "match_count": payload.get("match_count", 0),
                             "has_query_match": has_query_match,
+                            "claim_support": claim_support,
                             "snippets": snippets[:3],
                         },
                     ))
@@ -439,21 +477,38 @@ class EvidenceStore:
 
             if (tool_name == "paper_search" or payload.get("source_type") == "academic_paper") and isinstance(payload.get("papers"), list):
                 raw_level = self._normalize_level(payload.get("evidence_level"))
+                seen_paper_sources: set[str] = set()
+                seen_paper_titles: set[str] = set()
                 for paper in payload["papers"]:
                     if not isinstance(paper, dict):
                         continue
                     source = paper.get("url", "") or paper.get("pdf_url", "")
-                    level = self._cap_structured_level(raw_level, tool_name, payload, source=source)
                     title = str(paper.get("title", "") or "Academic paper")
+                    source_key = str(source).lower()
+                    title_key = self._normalize_title_key(title)
+                    if (source_key and source_key in seen_paper_sources) or (title_key and title_key in seen_paper_titles):
+                        continue
+                    if source_key:
+                        seen_paper_sources.add(source_key)
+                    if title_key:
+                        seen_paper_titles.add(title_key)
+                    level = self._cap_structured_level(raw_level, tool_name, payload, source=source)
                     summary = str(paper.get("summary", "") or "")
+                    relevance = self._paper_relevance_gate(paper, payload, task)
+                    if level in (EvidenceLevel.EVIDENCE_BACKED, EvidenceLevel.VERIFIED) and not relevance["passed"]:
+                        level = EvidenceLevel.SPECULATIVE
                     citation_count = paper.get("citation_count")
                     citation_note = f" citation_count={citation_count}." if citation_count is not None else ""
+                    gate_note = f" Relevance gate: {relevance['quality_gate_reason']}."
                     items.append(EvidenceItem(
                         claim=self._claim_from_output(f"{title}. {summary}"),
                         level=level if source else EvidenceLevel.SPECULATIVE,
                         source_tier=SourceTier.ACADEMIC if source else SourceTier.UNVERIFIED,
                         source=source,
-                        rationale=f"Academic literature search result from {paper.get('source', payload.get('backend', 'unknown'))}.{citation_note}",
+                        rationale=(
+                            f"Academic literature search result from {paper.get('source', payload.get('backend', 'unknown'))}."
+                            f"{citation_note}{gate_note}"
+                        ),
                         task_id=result.task_id,
                         confidence=result.confidence,
                         source_count=1 if source else 0,
@@ -468,48 +523,12 @@ class EvidenceStore:
                             "published": paper.get("published", ""),
                             "citation_count": citation_count,
                             "backend": payload.get("backend", ""),
+                            "evidence_relevance_score": relevance["score"],
+                            "matched_terms": relevance["matched_terms"],
+                            "quality_gate_reason": relevance["quality_gate_reason"],
                         },
                     ))
                 continue
-
-            if registry_type in ("dataset", "method") and isinstance(payload.get("results"), list):
-                raw_level = self._normalize_level(payload.get("evidence_level"))
-                for record in payload["results"]:
-                    if not isinstance(record, dict):
-                        continue
-                    sources = record.get("official_sources") if isinstance(record.get("official_sources"), list) else []
-                    source = ""
-                    if sources and isinstance(sources[0], dict):
-                        source = sources[0].get("url", "") or sources[0].get("title", "")
-                    level = self._cap_structured_level(raw_level, tool_name, payload, source=source)
-                    source_type = self._structured_source_type(tool_name, payload, source=source, official_sources=sources)
-                    claim = record.get("dataset") or record.get("method") or str(record)[:300]
-                    rationale_parts = record.get("limitations") or record.get("valid_for") or []
-                    rationale = "; ".join(str(part) for part in rationale_parts[:2]) if isinstance(rationale_parts, list) else str(rationale_parts)
-                    if source_type == "registry_curated_with_official_url":
-                        rationale = (rationale + " " if rationale else "") + "Curated registry record with an official URL; source-backed but not page-grounded."
-                    else:
-                        rationale = (rationale + " " if rationale else "") + "Curated registry record; treat as heuristic until verified by external retrieval."
-                    items.append(EvidenceItem(
-                        claim=str(claim),
-                        level=level,
-                        source_tier=self.classify_source_tier(source) if self._is_external_url(source) else SourceTier.UNVERIFIED,
-                        source=source,
-                        rationale=rationale,
-                        task_id=result.task_id,
-                        confidence=result.confidence,
-                        source_count=1 if self._is_external_url(source) else 0,
-                        metadata={
-                            "tool": tool_name,
-                            "task_type": task_type,
-                            "status": result.status.value,
-                            "registry_type": registry_type,
-                            "sources": sources,
-                            "source_type": source_type,
-                            "raw_evidence_level": raw_level.value,
-                            "requires_external_verification": bool(payload.get("requires_external_verification", True)),
-                        },
-                    ))
 
         return items
 
@@ -531,6 +550,100 @@ class EvidenceStore:
             return EvidenceLevel.REJECTED
         return EvidenceLevel.SPECULATIVE
 
+    def _source_tier_from_value(self, value: Any) -> SourceTier:
+        normalized = str(value or "").lower()
+        for tier in SourceTier:
+            if normalized == tier.value:
+                return tier
+        return SourceTier.UNVERIFIED
+
+    def _paper_relevance_gate(
+        self,
+        paper: dict[str, Any],
+        payload: dict[str, Any],
+        task: SubTask | None = None,
+    ) -> dict[str, Any]:
+        context = " ".join([
+            str(payload.get("query", "") or ""),
+            task.description if task else "",
+            " ".join(task.search_hints) if task else "",
+        ])
+        query_terms = self._evidence_terms(context)
+        if not query_terms:
+            return {
+                "passed": True,
+                "score": 1.0,
+                "matched_terms": [],
+                "quality_gate_reason": "no_specific_query_terms_available",
+            }
+
+        paper_text = " ".join([
+            str(paper.get("title", "") or ""),
+            str(paper.get("summary", "") or ""),
+            str(paper.get("published", "") or ""),
+        ]).lower()
+        matched_terms = sorted(term for term in query_terms if term in paper_text)
+        denominator = max(1, min(len(query_terms), 8))
+        score = min(1.0, len(matched_terms) / denominator)
+
+        location_terms = self._location_terms(context)
+        requires_location = self._requires_location_match(context, task)
+        missing_location = bool(
+            requires_location
+            and location_terms
+            and not any(term in paper_text for term in location_terms)
+        )
+        if missing_location:
+            score = min(score, 0.35)
+
+        passed = score >= 0.45
+        reason = "matched_specific_query_terms" if passed else "weak_query_or_location_match"
+        if missing_location:
+            reason = "missing_location_match"
+
+        return {
+            "passed": passed,
+            "score": round(score, 3),
+            "matched_terms": matched_terms,
+            "quality_gate_reason": reason,
+        }
+
+    def _evidence_terms(self, text: str) -> set[str]:
+        terms = {
+            term
+            for term in re.findall(r"[a-zA-Z][a-zA-Z0-9\-]{2,}|\d{4}", text.lower())
+            if term not in self.RELEVANCE_STOPWORDS
+        }
+        return terms
+
+    def _location_terms(self, text: str) -> set[str]:
+        known_locations = {
+            "wuhan", "beijing", "shanghai", "guangzhou", "shenzhen", "nanjing",
+            "nanchang", "chengdu", "chongqing", "hangzhou", "dhaka", "delhi",
+            "kayseri", "kharkiv",
+        }
+        lower = text.lower()
+        return {location for location in known_locations if location in lower}
+
+    def _requires_location_match(self, context: str, task: SubTask | None = None) -> bool:
+        lower = context.lower()
+        method_markers = {
+            "method", "methods", "algorithm", "formula", "retrieval", "radiative", "single-channel",
+            "split-window", "moran", "regression", "validation", "workflow", "方法", "算法",
+            "公式", "反演", "验证", "流程", "空间自相关", "回归",
+        }
+        if any(marker in lower for marker in method_markers):
+            return False
+        if task and task.task_type in (TaskType.METHOD_DESIGN, TaskType.GEO_VALIDATION):
+            return False
+        if task and task.task_type in (TaskType.LITERATURE, TaskType.ANALYZE):
+            return True
+        empirical_markers = {"case study", "impact", "effect", "expansion", "影响", "扩张", "案例", "实证"}
+        return any(marker in lower for marker in empirical_markers)
+
+    def _normalize_title_key(self, title: str) -> str:
+        return " ".join(re.findall(r"[a-zA-Z0-9]+", title.lower()))
+
     def _level_from_structured_tool(self, result: AgentResult, sources: list[dict[str, Any]] | None = None) -> EvidenceLevel | None:
         """Read explicit evidence levels from structured tools when available."""
         sources = sources or []
@@ -549,13 +662,6 @@ class EvidenceStore:
                 continue
             tool_name = step.get("name", "")
             source = self._source_for_structured_payload(tool_name, payload)
-            if payload.get("registry_type") in ("dataset", "method"):
-                for external_source in sources:
-                    candidate_source = external_source.get("url", "") or external_source.get("title", "")
-                    if self._is_external_url(candidate_source):
-                        source = candidate_source
-                        break
-
             levels = []
             if payload.get("evidence_level"):
                 levels.append(str(payload["evidence_level"]))

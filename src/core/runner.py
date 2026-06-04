@@ -75,6 +75,13 @@ def _create_tools_factory(config: dict):
     """创建工具工厂函数，返回 Agent 可用的工具列表。"""
     tools_cfg = config.get("tools", {})
     mock_mode = tools_cfg.get("web_search", {}).get("mock_mode", True)
+    from src.core.domain_profiles import resolve_domain_profile
+    from src.utils.output_language import normalize_output_language
+
+    domain_profile = resolve_domain_profile(config)
+    output_cfg = config.get("output", {}) or {}
+    output_language = normalize_output_language(output_cfg.get("language", "zh-CN"))
+    domain_profile["output_language"] = output_language
 
     from src.tools import (
         WebSearchTool,
@@ -89,19 +96,27 @@ def _create_tools_factory(config: dict):
         CodeSandboxTool,
         CalculatorTool,
         NotepadTool,
-        DatasetRegistryTool,
-        MethodRegistryTool,
-        GeoPlanValidatorTool,
+        WikiSearchTool,
     )
 
     tools = {}
+    wiki_store = config.get("_wiki_store")
+    wiki_cfg = config.get("wiki", {})
+    if wiki_cfg.get("enabled", False) and wiki_store is not None:
+        tools["wiki_search"] = WikiSearchTool(wiki_store)
 
     # 1. web_search
     if mock_mode:
         tools["web_search"] = MockWebSearchTool()
     else:
         tools["web_search"] = WebSearchTool()
-        tools["official_source_search"] = OfficialSourceSearchTool()
+        official_search_cfg = tools_cfg.get("official_source_search", {})
+        tools["official_source_search"] = OfficialSourceSearchTool(
+            max_domain_queries=official_search_cfg.get("max_domain_queries", 4),
+            max_query_variants=official_search_cfg.get("max_query_variants", 2),
+            max_attempts=official_search_cfg.get("max_attempts", 6),
+            preferred_domains=domain_profile.get("preferred_official_domains", []),
+        )
         doc_fetcher_cfg = tools_cfg.get("official_doc_fetcher", {})
         if doc_fetcher_cfg.get("enabled", True):
             tools["official_doc_fetcher"] = OfficialDocFetcherTool(
@@ -122,26 +137,30 @@ def _create_tools_factory(config: dict):
             backend=paper_cfg.get("backend", "openalex"),
             use_mock=mock_mode,
         )
-    tools["arxiv_reader"] = ArxivReaderTool(use_mock=mock_mode)
+    arxiv_cfg = tools_cfg.get("arxiv_reader", {})
+    if arxiv_cfg.get("enabled", False):
+        tools["arxiv_reader"] = ArxivReaderTool(use_mock=mock_mode)
 
-    # 4. file_reader（不限制目录）
-    tools["file_reader"] = FileReaderTool(allowed_base_dir=None)
+    # 4. file_reader（默认不暴露；用户上传/指定本地文件时再通过 profile 打开）
+    file_reader_cfg = tools_cfg.get("file_reader", {})
+    if file_reader_cfg.get("enabled", False):
+        tools["file_reader"] = FileReaderTool(allowed_base_dir=file_reader_cfg.get("allowed_base_dir"))
 
     # 5. code_sandbox
-    tools["code_sandbox"] = CodeSandboxTool(use_mock=mock_mode)
+    code_sandbox_cfg = tools_cfg.get("code_sandbox", {})
+    if code_sandbox_cfg.get("enabled", False):
+        tools["code_sandbox"] = CodeSandboxTool(use_mock=mock_mode)
 
     # 6. calculator
     tools["calculator"] = CalculatorTool()
 
     # 7. notepad
-    tools["notepad"] = NotepadTool()
+    notepad_cfg = tools_cfg.get("notepad", {})
+    if notepad_cfg.get("enabled", False):
+        tools["notepad"] = NotepadTool()
 
-    # 8. GIS / remote-sensing structured registry tools
-    geo_tools_cfg = tools_cfg.get("geo_registry", {})
-    if geo_tools_cfg.get("enabled", False):
-        tools["dataset_registry"] = DatasetRegistryTool()
-        tools["method_registry"] = MethodRegistryTool()
-        tools["geo_plan_validator"] = GeoPlanValidatorTool()
+    active_names = set(domain_profile.get("exposed_tools", [])) & set(tools)
+    tools = {name: tool for name, tool in tools.items() if name in active_names}
 
     # 返回列表形式（AgentPool 和 Agent 构造函数需要 list）
     return list(tools.values())
@@ -171,6 +190,16 @@ def initialize_modules(
     logger.info("正在初始化核心模块...")
 
     modules: dict[str, Any] = {}
+    from src.core.domain_profiles import resolve_domain_profile
+    from src.utils.output_language import normalize_output_language
+
+    domain_profile = resolve_domain_profile(config)
+    output_cfg = config.get("output", {}) or {}
+    output_language = normalize_output_language(output_cfg.get("language", "zh-CN"))
+    domain_profile["output_language"] = output_language
+    modules["domain_profile"] = domain_profile
+    agent_config = dict(config.get("agents", {}) or {})
+    agent_config.setdefault("output_language", output_language)
     user_id = user_id or str(config.get("_user_id", "") or "")
     session_id = session_id or str(config.get("_session_id", "") or "")
     run_id = run_id or str(config.get("_run_id", "") or session_id or "")
@@ -184,6 +213,8 @@ def initialize_modules(
             user_id=user_id,
             session_id=session_id,
             run_id=run_id,
+            domain_profile=domain_profile.get("name", "general"),
+            model_preset=config.get("model", {}).get("active_preset", ""),
         )
     modules["trace_recorder"] = trace_recorder
 
@@ -216,6 +247,7 @@ def initialize_modules(
         "red_agent",
         "blue_agent",
         "judge",
+        "wiki_ingest",
     }
     for module_name in sorted(known_policy_modules | set(backend_mapping)):
         kwargs = model_factory.describe_module(module_name)
@@ -270,32 +302,49 @@ def initialize_modules(
         f"(user={user_id or '*'}, session={session_id or '*'}, run={run_id or '*'})"
     )
 
+    # Phase 8: Markdown Wiki Store
+    wiki_store = None
+    wiki_cfg = config.get("wiki", {})
+    if wiki_cfg.get("enabled", False):
+        from src.wiki import WikiStore
+
+        wiki_store = WikiStore(
+            root_dir=wiki_cfg.get("root_dir", "data/wiki"),
+            user_id=user_id or "default",
+        )
+        modules["wiki_store"] = wiki_store
+        config["_wiki_store"] = wiki_store
+        logger.info(f"[M8] Wiki Store 模块已初始化 (user={user_id or 'default'})")
+
     # Tools（真实工具或 Mock 工具）
     tools_list = _create_tools_factory(config)
     modules["tools"] = tools_list
     logger.info(f"Tools 模块已初始化（共 {len(tools_list)} 个工具）")
 
-    # M5: Red-Blue Adversarial Loop（先创建，再注入 Orchestrator）
-    from src.adversarial.loop import AdversarialLoop
-    from src.adversarial.red_agent import RedAgent
-    from src.adversarial.blue_agent import BlueAgent
-
-    red_policy = modules.get("red_agent_policy", default_policy)
-    blue_policy = modules.get("blue_agent_policy", default_policy)
     adversarial_cfg = config.get("adversarial", {})
+    adversarial_loop = None
+    if adversarial_cfg.get("enabled", False):
+        # M5: Red-Blue Adversarial Loop（启用时创建，再注入 Orchestrator）
+        from src.adversarial.loop import AdversarialLoop
+        from src.adversarial.red_agent import RedAgent
+        from src.adversarial.blue_agent import BlueAgent
 
-    red_agent = RedAgent(policy=red_policy)
-    blue_agent = BlueAgent(policy=blue_policy, tools=tools_list)
-    adversarial_loop = AdversarialLoop(
-        red_agent=red_agent,
-        blue_agent=blue_agent,
-        policy=modules.get("judge_policy", default_policy),
-        max_rounds=adversarial_cfg.get("max_rounds", 3),
-        score_threshold=adversarial_cfg.get("score_threshold", 8.0),
-        delta_threshold=adversarial_cfg.get("delta_threshold", 0.3),
-    )
-    modules["adversarial"] = adversarial_loop
-    logger.info("[M5] Adversarial 模块已初始化")
+        red_policy = modules.get("red_agent_policy", default_policy)
+        blue_policy = modules.get("blue_agent_policy", default_policy)
+        red_agent = RedAgent(policy=red_policy)
+        blue_agent = BlueAgent(policy=blue_policy, tools=tools_list)
+        adversarial_loop = AdversarialLoop(
+            red_agent=red_agent,
+            blue_agent=blue_agent,
+            policy=modules.get("judge_policy", default_policy),
+            max_rounds=adversarial_cfg.get("max_rounds", 3),
+            score_threshold=adversarial_cfg.get("score_threshold", 8.0),
+            delta_threshold=adversarial_cfg.get("delta_threshold", 0.3),
+        )
+        modules["adversarial"] = adversarial_loop
+        logger.info("[M5] Adversarial 模块已初始化")
+    else:
+        logger.info("[M5] Adversarial 模块已禁用")
 
     # M1: Multi-Agent Orchestrator
     from src.orchestrator.orchestrator import Orchestrator
@@ -308,7 +357,8 @@ def initialize_modules(
         policy_factory_by_type={
             "synthesis": lambda: _create_policy("summarizer", use_cache=False),
         },
-        agent_config=config.get("agents", {}),
+        agent_config=agent_config,
+        domain_profile=domain_profile,
         trace_recorder=trace_recorder,
         progress_callback=config.get("_progress_callback"),
     )
@@ -321,6 +371,9 @@ def initialize_modules(
         compressor=compressor,
         adversarial_loop=adversarial_loop,
         memory_store=memory_store,
+        wiki_store=wiki_store,
+        wiki_config=wiki_cfg,
+        wiki_ingest_policy=modules.get("wiki_ingest_policy", modules.get("summarizer_policy", default_policy)),
         summarizer_policy=modules.get("summarizer_policy", default_policy),
         trace_recorder=trace_recorder,
         progress_callback=config.get("_progress_callback"),
@@ -339,6 +392,8 @@ def initialize_modules(
         trace_recorder.record(
             "modules_init_end",
             tools=[getattr(tool, "name", type(tool).__name__) for tool in tools_list],
+            domain_profile=domain_profile.get("name", "general"),
+            model_preset=getattr(model_factory, "active_preset", ""),
         )
 
     return modules

@@ -14,6 +14,7 @@ Deep Research Agent — 核心编排器 (M1: Multi-Agent Orchestrator)
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from typing import Any, Callable
 
@@ -60,6 +61,9 @@ class Orchestrator:
         compressor: Any | None = None,
         adversarial_loop: Any | None = None,
         memory_store: Any | None = None,
+        wiki_store: Any | None = None,
+        wiki_config: dict[str, Any] | None = None,
+        wiki_ingest_policy: Any | None = None,
         summarizer_policy: Any | None = None,
         trace_recorder: Any | None = None,
         progress_callback: Callable[[dict[str, Any]], Any] | None = None,
@@ -72,6 +76,9 @@ class Orchestrator:
         self.compressor = compressor
         self.adversarial_loop = adversarial_loop
         self.memory_store = memory_store
+        self.wiki_store = wiki_store
+        self.wiki_config = wiki_config or {}
+        self.wiki_ingest_policy = wiki_ingest_policy
         self.summarizer_policy = summarizer_policy
         self.trace_recorder = trace_recorder
         self.progress_bus = ProgressBus(progress_callback)
@@ -93,6 +100,7 @@ class Orchestrator:
         self._start_time: float = 0.0
         self._replan_count: int = 0
         self._adversarial_count: int = 0
+        self._wiki_ingest_threads: list[threading.Thread] = []
 
         # 状态机处理器映射
         self._state_handlers: dict[OrchestratorState, Callable[[], asyncio.Future[OrchestratorState]]] = {
@@ -227,6 +235,9 @@ class Orchestrator:
                     print(f"[M4] Final report stored to memory (confidence={report.confidence:.2f})")
                 except Exception as e:
                     print(f"[M4] Failed to store final report: {e}")
+
+            self._maybe_save_wiki_report(report)
+            self._maybe_join_wiki_ingest_threads()
 
             return report
 
@@ -569,7 +580,14 @@ class Orchestrator:
         if not isinstance(agent, SummarizerAgent):
             # 优先使用配置的 summarizer_policy（更大的 max_tokens），fallback 到 agent.policy
             policy = self.summarizer_policy or agent.policy
-            agent = SummarizerAgent(name="summarizer", policy=policy, tools=agent.tools, pool_type_key=TaskType.SYNTHESIS.value)
+            output_language = getattr(self.agent_pool, "domain_profile", {}).get("output_language", "zh-CN")
+            agent = SummarizerAgent(
+                name="summarizer",
+                policy=policy,
+                tools=agent.tools,
+                pool_type_key=TaskType.SYNTHESIS.value,
+                output_language=output_language,
+            )
 
         try:
             result = await asyncio.wait_for(
@@ -734,6 +752,18 @@ class Orchestrator:
         否则回退到运行时 dict 遍历。
         """
         # M4: 语义检索相关记忆
+        wiki_context = ""
+        if self.wiki_store is not None:
+            try:
+                wiki_context = self.wiki_store.get_context(
+                    self._query,
+                    max_chars=int(self.wiki_config.get("max_context_chars", 2000)),
+                )
+                if wiki_context:
+                    print(f"[M8] Retrieved {len(wiki_context)} chars of wiki context")
+            except Exception as e:
+                print(f"[M8] Wiki context query failed: {e}")
+
         if self.memory_store is not None:
             try:
                 ctx = self.memory_store.get_context_for_query(
@@ -741,7 +771,7 @@ class Orchestrator:
                 )
                 if ctx:
                     print(f"[M4] Retrieved {len(ctx)} chars of semantic memory context")
-                    return ctx
+                    return "\n\n".join(part for part in [wiki_context, ctx] if part)
             except Exception as e:
                 print(f"[M4] Semantic memory query failed: {e}, falling back to dict")
 
@@ -767,12 +797,21 @@ class Orchestrator:
                 except Exception as e:
                     print(f"[M3] Compression failed: {e}, using raw context")
 
-        return "\n".join(parts) if parts else ""
+        runtime_context = "\n".join(parts) if parts else ""
+        return "\n\n".join(part for part in [wiki_context, runtime_context] if part)
 
     def _build_task_context(self, subtask: SubTask) -> dict:
         """为单个 SubTask 构建执行上下文。"""
         ctx = dict(self._memory_store)
         ctx["query"] = self._query
+        if self.wiki_store is not None:
+            try:
+                ctx["wiki_context"] = self.wiki_store.get_context(
+                    " ".join(part for part in [self._query, subtask.description, " ".join(subtask.search_hints)] if part),
+                    max_chars=int(self.wiki_config.get("task_context_chars", self.wiki_config.get("max_context_chars", 2000))),
+                )
+            except Exception as e:
+                print(f"[M8] Wiki task context query failed: {e}")
         # 注入依赖任务的结果
         for dep_id in subtask.dependencies:
             dep_key = f"result:{dep_id}"
@@ -780,6 +819,225 @@ class Orchestrator:
                 ctx[f"dep:{dep_id}"] = self._memory_store[dep_key]
         ctx = self._apply_user_instructions(subtask, ctx)
         return ctx
+
+    def _maybe_save_wiki_report(self, report: ResearchReport) -> None:
+        """Save a final report as a wiki draft when evidence quality is sufficient."""
+        if self.wiki_store is None:
+            return
+
+        allowed, reason, metadata = self._wiki_ingest_gate(report)
+        if self.trace_recorder:
+            self.trace_recorder.record(
+                "wiki_ingest_gate",
+                allowed=allowed,
+                reason=reason,
+                metadata=metadata,
+            )
+        if not allowed:
+            print(f"[M8] Wiki ingest skipped: {reason}")
+            return
+
+        try:
+            raw_dedup_cfg = (self.wiki_config.get("ingest", {}) or {}).get("raw_dedup", {}) or {}
+            if raw_dedup_cfg.get("enabled", True) and hasattr(self.wiki_store, "find_similar_raw"):
+                similar = self.wiki_store.find_similar_raw(
+                    title=report.query[:80],
+                    content=report.content,
+                    metadata=metadata,
+                    threshold=float(raw_dedup_cfg.get("threshold", 0.72)),
+                )
+                if similar is not None:
+                    if self.trace_recorder:
+                        self.trace_recorder.record(
+                            "wiki_raw_duplicate_reused",
+                            path=similar.path,
+                            score=round(float(similar.score), 4),
+                            title=similar.title,
+                        )
+                    print(f"[M8] Wiki raw duplicate reused: {similar.path} (score={similar.score:.2f})")
+                    if raw_dedup_cfg.get("reingest_duplicate", False):
+                        self._maybe_schedule_wiki_structured_ingest(
+                            raw_path=similar.path,
+                            report=report,
+                            metadata={**metadata, "raw_duplicate_of": similar.path},
+                        )
+                    return
+
+            path = self.wiki_store.save_raw(
+                title=report.query[:80],
+                content=report.content,
+                metadata=metadata,
+                status="draft",
+            )
+            if self.trace_recorder:
+                self.trace_recorder.record("wiki_saved", path=path, status="draft")
+            print(f"[M8] Wiki raw draft saved: {path}")
+            self._maybe_schedule_wiki_structured_ingest(
+                raw_path=path,
+                report=report,
+                metadata=metadata,
+            )
+        except Exception as exc:
+            if self.trace_recorder:
+                self.trace_recorder.record(
+                    "wiki_save_error",
+                    error=f"{type(exc).__name__}: {exc}",
+            )
+            print(f"[M8] Wiki save failed: {exc}")
+
+    def _maybe_schedule_wiki_structured_ingest(
+        self,
+        raw_path: str,
+        report: ResearchReport,
+        metadata: dict[str, Any],
+    ) -> None:
+        ingest_cfg = (self.wiki_config.get("ingest", {}) or {}).get("structured", {}) or {}
+        if not ingest_cfg.get("enabled", False):
+            return
+        if self.wiki_ingest_policy is None and self.summarizer_policy is None:
+            if self.trace_recorder:
+                self.trace_recorder.record(
+                    "wiki_structured_ingest_skipped",
+                    reason="missing_llm_policy",
+                    raw_path=raw_path,
+                )
+            print("[M8] Wiki structured ingest skipped: missing_llm_policy")
+            return
+        mode = str(ingest_cfg.get("mode", "background")).lower()
+        max_entities = int(ingest_cfg.get("max_entities", 8))
+        max_source_chars = int(ingest_cfg.get("max_source_chars", 18000))
+        if self.trace_recorder:
+            self.trace_recorder.record(
+                "wiki_structured_ingest_scheduled",
+                raw_path=raw_path,
+                mode=mode,
+                extractor=ingest_cfg.get("extractor", "llm"),
+            )
+        if mode == "sync":
+            self._run_wiki_structured_ingest(
+                raw_path,
+                report,
+                metadata,
+                max_entities=max_entities,
+                max_source_chars=max_source_chars,
+            )
+            return
+        thread = threading.Thread(
+            target=self._run_wiki_structured_ingest,
+            kwargs={
+                "raw_path": raw_path,
+                "report": report,
+                "metadata": metadata,
+                "max_entities": max_entities,
+                "max_source_chars": max_source_chars,
+            },
+            name="wiki-structured-ingest",
+            daemon=True,
+        )
+        thread.start()
+        self._wiki_ingest_threads.append(thread)
+
+    def _maybe_join_wiki_ingest_threads(self) -> None:
+        ingest_cfg = (self.wiki_config.get("ingest", {}) or {}).get("structured", {}) or {}
+        if not ingest_cfg.get("join_on_exit", False):
+            return
+        timeout = float(ingest_cfg.get("join_timeout_seconds", 60) or 60)
+        deadline = time.time() + max(0.0, timeout)
+        for thread in list(self._wiki_ingest_threads):
+            remaining = max(0.0, deadline - time.time())
+            if remaining <= 0:
+                break
+            thread.join(timeout=remaining)
+        alive = [thread.name for thread in self._wiki_ingest_threads if thread.is_alive()]
+        self._wiki_ingest_threads = [thread for thread in self._wiki_ingest_threads if thread.is_alive()]
+        if self.trace_recorder:
+            self.trace_recorder.record(
+                "wiki_structured_ingest_join",
+                timeout_seconds=timeout,
+                pending_threads=alive,
+            )
+        if alive:
+            print(f"[M8] Wiki structured ingest still running after join timeout: {alive}")
+
+    def _run_wiki_structured_ingest(
+        self,
+        raw_path: str,
+        report: ResearchReport,
+        metadata: dict[str, Any],
+        max_entities: int,
+        max_source_chars: int,
+    ) -> None:
+        try:
+            from src.wiki import WikiIngestWorker
+
+            worker = WikiIngestWorker(
+                self.wiki_store,
+                policy=self.wiki_ingest_policy or self.summarizer_policy,
+                max_entities=max_entities,
+                max_source_chars=max_source_chars,
+                output_language=getattr(self.agent_pool, "domain_profile", {}).get("output_language", "zh-CN"),
+            )
+            result = worker.ingest_raw_report(
+                raw_path=raw_path,
+                title=report.query[:80],
+                content=report.content,
+                metadata=metadata,
+            )
+            if self.trace_recorder:
+                self.trace_recorder.record("wiki_structured_ingest_done", **result)
+            print(f"[M8] Wiki structured ingest done: {result['entity_count']} pages")
+        except Exception as exc:
+            if self.trace_recorder:
+                self.trace_recorder.record(
+                    "wiki_structured_ingest_error",
+                    raw_path=raw_path,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+            print(f"[M8] Wiki structured ingest failed: {exc}")
+
+    def _wiki_ingest_gate(self, report: ResearchReport) -> tuple[bool, str, dict[str, Any]]:
+        counts = getattr(report, "evidence_summary", {}).get("counts", {}) or {}
+        strong_evidence = int(counts.get("verified", 0) or 0) + int(counts.get("evidence_backed", 0) or 0)
+        successful_results = sum(1 for result in self._results if result.status == AgentStatus.SUCCESS)
+        has_mock_source = any(
+            self.evidence_store._is_mock_source(source)
+            for source in (getattr(report, "sources", []) or [])
+            if isinstance(source, dict)
+        )
+        metadata = {
+            "query": report.query,
+            "evidence_level": "evidence_backed" if strong_evidence else "speculative",
+            "source_tier": self._best_report_source_tier(),
+            "confidence": report.confidence,
+            "successful_tasks": successful_results,
+            "strong_evidence_count": strong_evidence,
+            "num_searches": report.num_searches,
+            "num_replan": report.num_replan,
+            "adversarial_rounds": report.adversarial_rounds,
+        }
+
+        if not report.content or "Research failed due to persistent errors" in report.content:
+            return False, "report_is_failure_fallback", metadata
+        if successful_results < 1:
+            return False, "no_successful_subtasks", metadata
+        min_confidence = float((self.wiki_config.get("ingest", {}) or {}).get("min_confidence", 0.5))
+        if report.confidence < min_confidence:
+            return False, "confidence_below_threshold", metadata
+        if strong_evidence < 1:
+            return False, "no_evidence_backed_or_verified_evidence", metadata
+        if has_mock_source:
+            return False, "mock_source_present", metadata
+        return True, "passed", metadata
+
+    def _best_report_source_tier(self) -> str:
+        source_tiers: list[str] = []
+        for result in self._results:
+            for item in result.evidence_items:
+                source_tiers.append(item.source_tier.value)
+        for tier in ("official", "academic", "authoritative", "general", "unverified"):
+            if tier in source_tiers:
+                return tier
+        return "unverified"
 
     def _apply_user_instructions(self, subtask: SubTask, context: dict) -> dict:
         if self.interactive_bus is None or not self.interactive_bus.has_pending():

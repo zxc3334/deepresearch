@@ -110,6 +110,11 @@ agents:
       tool_result_budget_chars: 4000
       synthesis_context_budget_tokens: 24000
       head_tail_ratio: 0.70
+      auto_fetch_official_docs: true
+      auto_fetch_official_max_urls: 1
+      auto_fetch_official_timeout_seconds: 12
+      auto_fetch_official_max_chars: 6000
+      auto_fetch_official_max_snippets: 3
       chars_per_token: 3.5
   summarizer:
     compact:

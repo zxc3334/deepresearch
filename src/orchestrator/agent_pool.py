@@ -39,6 +39,7 @@ class AgentPool:
         max_idle: int = 3,
         policy_factory_by_type: dict[str, Callable] | None = None,
         agent_config: dict | None = None,
+        domain_profile: dict | None = None,
         trace_recorder=None,
         progress_callback=None,
     ) -> None:
@@ -47,6 +48,7 @@ class AgentPool:
         self.max_idle = max(max_idle, 1)
         self.policy_factory_by_type = policy_factory_by_type or {}
         self.agent_config = agent_config or {}
+        self.domain_profile = domain_profile or {}
         self.trace_recorder = trace_recorder
         self.progress_callback = progress_callback
 
@@ -157,9 +159,15 @@ class AgentPool:
             ),
             chars_per_token=loop_cfg.get("chars_per_token", 3.5),
             head_tail_ratio=loop_cfg.get("head_tail_ratio", 0.70),
+            auto_fetch_official_docs=loop_cfg.get("auto_fetch_official_docs", True),
+            auto_fetch_official_max_urls=loop_cfg.get("auto_fetch_official_max_urls", 1),
+            auto_fetch_official_timeout_seconds=loop_cfg.get("auto_fetch_official_timeout_seconds", 12.0),
+            auto_fetch_official_max_chars=loop_cfg.get("auto_fetch_official_max_chars", 6000),
+            auto_fetch_official_max_snippets=loop_cfg.get("auto_fetch_official_max_snippets", 3),
         )
         summarizer_cfg = self.agent_config.get("summarizer", {})
         summarizer_compact_cfg = summarizer_cfg.get("compact", {})
+        output_language = self.agent_config.get("output_language", self.domain_profile.get("output_language", "zh-CN"))
 
         def make_researcher(name: str) -> ResearcherAgent:
             return ResearcherAgent(
@@ -170,6 +178,7 @@ class AgentPool:
                 pool_type_key=type_key,
                 loop_config=tool_loop_config,
                 external_prefetch_config=researcher_cfg.get("external_prefetch", {}),
+                domain_profile=self.domain_profile,
                 trace_recorder=self.trace_recorder,
                 progress_callback=self.progress_callback,
             )
@@ -195,6 +204,7 @@ class AgentPool:
                 tools=tools,
                 pool_type_key=type_key,
                 compact_config=summarizer_compact_cfg,
+                output_language=output_language,
                 trace_recorder=self.trace_recorder,
             )
         else:

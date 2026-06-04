@@ -1,10 +1,10 @@
-"""Official documentation fetcher for GIS/remote-sensing evidence.
+"""Official documentation fetcher for page-grounded official evidence.
 
 This tool turns an official URL into page-grounded evidence snippets.  It is
 more constrained than the generic browser tool:
 
 - only HTTP(S) URLs are accepted;
-- official GIS/RS domains are allowlisted;
+- official documentation domains are allowlisted;
 - the output is structured for EvidenceStore and trace visualization.
 """
 from __future__ import annotations
@@ -15,13 +15,15 @@ from urllib.parse import urlparse
 
 import aiohttp
 
+from ..utils.text_cleanup import normalize_extracted_text, normalize_snippet
+
 
 class OfficialDocFetcherTool:
     """Fetch an official page and extract query-relevant evidence snippets."""
 
     name = "official_doc_fetcher"
     description = (
-        "Fetch and read an official GIS/remote-sensing documentation URL, then extract evidence snippets. "
+        "Fetch and read an official documentation URL, then extract page-grounded evidence snippets. "
         "Use this after official_source_search when you need page-grounded evidence instead of only a search result. "
         "Input: {'url': str, 'query': str(optional), 'max_chars': int(optional), 'max_snippets': int(optional)}."
     )
@@ -39,6 +41,13 @@ class OfficialDocFetcherTool:
         "copernicus.eu",
         "developers.google.com",
         "planetarycomputer.microsoft.com",
+        "docs.python.org",
+        "developer.mozilla.org",
+        "docs.github.com",
+        "learn.microsoft.com",
+        "cloud.google.com",
+        "docs.aws.amazon.com",
+        "platform.openai.com",
     ]
 
     def __init__(
@@ -99,7 +108,7 @@ class OfficialDocFetcherTool:
         if not self._is_allowed_official_url(url):
             return self._error(
                 url,
-                "URL is outside the official GIS/remote-sensing allowlist.",
+                "URL is outside the official documentation allowlist.",
                 source_type="rejected_url",
             )
 
@@ -110,7 +119,7 @@ class OfficialDocFetcherTool:
         if not self._is_allowed_official_url(final_url):
             return self._error(
                 final_url,
-                "Final redirected URL is outside the official GIS/remote-sensing allowlist.",
+                "Final redirected URL is outside the official documentation allowlist.",
                 source_type="rejected_url",
             )
 
@@ -123,15 +132,17 @@ class OfficialDocFetcherTool:
 
         snippets = self._extract_snippets(text, query=query, max_snippets=max_snippets)
         match_count = sum(1 for snippet in snippets if snippet.get("match_score", 0) > 0)
+        claim_support = self._verify_claim_support(query=query, text=text, snippets=snippets)
         result = {
             "title": title or self._title_from_url(final_url),
             "url": final_url,
-            "snippet": snippets[0]["text"] if snippets else text[:600],
+            "snippet": normalize_snippet(snippets[0]["text"] if snippets else text[:600], max_chars=600),
             "snippets": snippets,
             "content_chars": len(text),
             "truncated": truncated,
             "official_domain": urlparse(final_url).netloc.lower(),
             "source_type": "official_doc",
+            "claim_support": claim_support,
         }
         return {
             "query": query,
@@ -140,9 +151,10 @@ class OfficialDocFetcherTool:
             "results": [result],
             "total": 1,
             "match_count": match_count,
+            "claim_support": claim_support,
             "source": "official_doc_fetcher",
             "source_type": "official_doc",
-            "evidence_level": "evidence_backed" if match_count else "speculative",
+            "evidence_level": "evidence_backed" if claim_support["level"] == "supported" else "speculative",
         }
 
     async def _fetch(self, url: str) -> tuple[str, str]:
@@ -194,7 +206,7 @@ class OfficialDocFetcherTool:
         snippets = []
         for score, index, paragraph in scored[:max_snippets]:
             snippets.append({
-                "text": paragraph[:900],
+                "text": normalize_snippet(paragraph, max_chars=900),
                 "match_score": score,
                 "position": index,
             })
@@ -212,6 +224,70 @@ class OfficialDocFetcherTool:
                 continue
             keywords.append(token)
         return keywords[:12]
+
+    def _verify_claim_support(
+        self,
+        query: str,
+        text: str,
+        snippets: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        keywords = self._keywords(query)
+        required_groups = self._required_relevance_groups(query)
+        haystack = " ".join([
+            text[:20000],
+            " ".join(str(snippet.get("text", "")) for snippet in snippets if isinstance(snippet, dict)),
+        ]).lower()
+        matched_keywords = [keyword for keyword in keywords if keyword in haystack]
+        missing_keywords = [keyword for keyword in keywords if keyword not in haystack]
+        group_matches = [
+            {
+                "required_any": list(group),
+                "matched": [term for term in group if term in haystack],
+            }
+            for group in required_groups
+        ]
+        required_pass = all(item["matched"] for item in group_matches)
+        coverage = len(matched_keywords) / max(1, len(keywords))
+
+        if required_pass and (coverage >= 0.5 or not keywords):
+            level = "supported"
+            reason = "Official page contains the required entity terms and enough query keywords."
+        elif matched_keywords:
+            level = "weak_support"
+            reason = "Official page matches some query terms but does not fully support the claim."
+        else:
+            level = "unsupported"
+            reason = "Official page did not match the requested claim."
+
+        return {
+            "level": level,
+            "reason": reason,
+            "coverage": round(coverage, 3),
+            "matched_keywords": matched_keywords,
+            "missing_keywords": missing_keywords[:8],
+            "required_groups": group_matches,
+        }
+
+    def _required_relevance_groups(self, query: str) -> list[tuple[str, ...]]:
+        lower = str(query or "").lower()
+        groups: list[tuple[str, ...]] = []
+        if "sentinel-2" in lower or "sentinel 2" in lower or re.search(r"\bmsi\b", lower):
+            groups.append(("sentinel-2", "sentinel 2", "/s2", "s2-", "msi"))
+        if "landsat" in lower:
+            groups.append(("landsat", "tirs", "oli"))
+        if "modis" in lower or "mod11" in lower:
+            groups.append(("modis", "mod11"))
+        if "ecostress" in lower:
+            groups.append(("ecostress",))
+        if "earth engine" in lower or re.search(r"\bgee\b", lower):
+            groups.append(("earth engine", "google earth engine"))
+        if "python" in lower:
+            groups.append(("python",))
+        if "github" in lower:
+            groups.append(("github",))
+        if "openai" in lower:
+            groups.append(("openai",))
+        return groups
 
     def _is_allowed_official_url(self, url: str) -> bool:
         parsed = urlparse(url)
@@ -248,10 +324,9 @@ class OfficialDocFetcherTool:
         return re.sub(r"<[^>]+>", "\n", html)
 
     def _clean_text(self, text: str) -> str:
-        lines = [line.strip() for line in text.splitlines()]
+        lines = [line.strip() for line in normalize_extracted_text(text).splitlines()]
         lines = [line for line in lines if len(line) > 3]
-        text = "\n".join(lines)
-        return re.sub(r"\n{3,}", "\n\n", text)
+        return normalize_extracted_text("\n".join(lines))
 
     def _title_from_url(self, url: str) -> str:
         parsed = urlparse(url)

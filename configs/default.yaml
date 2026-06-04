@@ -205,10 +205,20 @@ wiki:
   ingest:
     min_confidence: 0.5
 
+agents:
+  researcher:
+    tool_loop:
+      # Upgrade official search hits into page-grounded official-document evidence.
+      auto_fetch_official_docs: true
+      auto_fetch_official_max_urls: 1
+      auto_fetch_official_timeout_seconds: 12
+      auto_fetch_official_max_chars: 6000
+      auto_fetch_official_max_snippets: 3
+
 adversarial:
   # M5: Red-Blue Adversarial Loop 配置
-  # 总开关：是否启用对抗降噪流程
-  enabled: true
+  # 默认关闭：主链路 demo 优先保证稳定性和成本可控；消融/审稿实验可单独开启。
+  enabled: false
   # Red-Blue 对抗最大轮数
   max_rounds: 10
   # Blue Agent 输出质量分阈值，达到此分即可提前终止对抗

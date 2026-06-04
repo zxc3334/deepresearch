@@ -48,6 +48,36 @@ KNOWN_PROVIDER_DEFAULTS: dict[str, dict[str, str]] = {
         "default_model": "gpt-4o",
         "default_base_url": "https://api.openai.com/v1",
     },
+    "openrouter": {
+        "env_prefix": "OPENROUTER",
+        "default_model": "openai/gpt-4o-mini",
+        "default_base_url": "https://openrouter.ai/api/v1",
+    },
+    "siliconflow": {
+        "env_prefix": "SILICONFLOW",
+        "default_model": "deepseek-ai/DeepSeek-V3",
+        "default_base_url": "https://api.siliconflow.cn/v1",
+    },
+    "moonshot": {
+        "env_prefix": "MOONSHOT",
+        "default_model": "moonshot-v1-8k",
+        "default_base_url": "https://api.moonshot.cn/v1",
+    },
+    "kimi": {
+        "env_prefix": "MOONSHOT",
+        "default_model": "moonshot-v1-8k",
+        "default_base_url": "https://api.moonshot.cn/v1",
+    },
+    "dashscope": {
+        "env_prefix": "DASHSCOPE",
+        "default_model": "qwen-plus",
+        "default_base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    },
+    "qwen": {
+        "env_prefix": "DASHSCOPE",
+        "default_model": "qwen-plus",
+        "default_base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    },
     "mimo": {
         "env_prefix": "MIMO",
         "default_model": "mimo-v2.5-pro",
@@ -61,6 +91,7 @@ POLICY_KWARG_KEYS = {
     "top_p",
     "max_tokens",
     "tools",
+    "response_format",
 }
 
 
@@ -140,17 +171,28 @@ class LLMModelFactory:
     def __init__(self, model_config: dict[str, Any] | None = None) -> None:
         ensure_env_loaded()
         self.model_config = model_config or {}
+        self.presets = self._load_presets()
+        self.active_preset = self._active_preset_name()
+        self.active_preset_config = self.presets.get(self.active_preset, {}) if self.active_preset else {}
         self.providers = self._load_providers()
         self.profiles = self._load_profiles()
-        self.module_profiles = self._load_module_profiles()
-        self.default_profile = str(
-            self.model_config.get("default_profile")
+        requested_default_profile = str(
+            self.active_preset_config.get("default_profile")
+            or self.model_config.get("default_profile")
             or self.model_config.get("default_module")
             or self.model_config.get("backend")
             or "default"
         )
+        if requested_default_profile not in self.profiles and self.active_preset_config.get("default_profile"):
+            raise ValueError(
+                f"Model preset '{self.active_preset}' references default_profile "
+                f"'{requested_default_profile}', but no such profile exists."
+            )
+        self.default_profile = requested_default_profile
         if self.default_profile not in self.profiles:
             self.default_profile = "default"
+        self.module_profiles = self._load_module_profiles()
+        self._validate_active_preset()
         self._cache: dict[str, PolicyAdapter] = {}
 
     def create_policy(
@@ -195,6 +237,7 @@ class LLMModelFactory:
             "module": module_name,
             "profile": resolved.profile_name,
             "provider": resolved.provider.name,
+            "active_preset": self.active_preset,
             "adapter": resolved.provider.adapter,
             "model": resolved.profile.model_name or resolved.provider.default_model,
             "temperature": resolved.profile.temperature,
@@ -242,14 +285,56 @@ class LLMModelFactory:
         return self._legacy_profiles()
 
     def _load_module_profiles(self) -> dict[str, str]:
+        merged: dict[str, str] = {}
         raw_mapping = self.model_config.get("module_profiles")
         if isinstance(raw_mapping, dict) and raw_mapping:
-            return {str(module): str(profile) for module, profile in raw_mapping.items()}
+            merged.update({str(module): str(profile) for module, profile in raw_mapping.items()})
 
         legacy_mapping = self.model_config.get("backend_mapping", {})
-        if isinstance(legacy_mapping, dict):
-            return {str(module): str(module) for module in legacy_mapping}
-        return {}
+        if not merged and isinstance(legacy_mapping, dict):
+            merged.update({str(module): str(module) for module in legacy_mapping})
+
+        preset_mapping = self.active_preset_config.get("module_profiles", {})
+        if isinstance(preset_mapping, dict):
+            merged.update({str(module): str(profile) for module, profile in preset_mapping.items()})
+        return merged
+
+    def _load_presets(self) -> dict[str, dict[str, Any]]:
+        raw_presets = self.model_config.get("presets")
+        if not isinstance(raw_presets, dict):
+            return {}
+        return {
+            str(name): dict(cfg or {})
+            for name, cfg in raw_presets.items()
+            if isinstance(cfg, dict)
+        }
+
+    def _active_preset_name(self) -> str:
+        active = self.model_config.get("active_preset")
+        if active is None:
+            active = self.model_config.get("_active_preset")
+        if active is None or str(active).strip() == "":
+            return ""
+        active_name = str(active)
+        if active_name not in self.presets:
+            available = ", ".join(sorted(self.presets)) or "(none)"
+            raise ValueError(f"Unknown model preset '{active_name}'. Available presets: {available}")
+        return active_name
+
+    def _validate_active_preset(self) -> None:
+        if not self.active_preset:
+            return
+        if self.default_profile not in self.profiles:
+            raise ValueError(
+                f"Model preset '{self.active_preset}' references default_profile "
+                f"'{self.default_profile}', but no such profile exists."
+            )
+        for module, profile_name in self.module_profiles.items():
+            if profile_name not in self.profiles:
+                raise ValueError(
+                    f"Model preset '{self.active_preset}' maps module '{module}' "
+                    f"to missing profile '{profile_name}'."
+                )
 
     def _legacy_profiles(self) -> dict[str, LLMProfileConfig]:
         default_provider = str(self.model_config.get("backend", "vllm")).lower()

@@ -1,140 +1,313 @@
-# GeoResearch Agent
+# DomainResearch Agent
 
-GeoResearch Agent 是一个 evidence-aware、domain-adaptive 的 DeepResearch Agent 项目。系统以通用深度研究流程为核心，通过可插拔 Domain Adapter，在同一套架构上支持“通用 DeepResearch”和“专业领域增强 DeepResearch”。GIS/遥感只是内置 demo adapter，后续可以替换成法律、医学、金融、政策研究等其它领域。
+DomainResearch Agent 是一个 **evidence-aware、domain-adaptive** 的 DeepResearch Agent 项目。它不是只给某个领域追加 prompt，而是把通用深度研究流程抽象成一套可扩展框架：
 
-它不是单次 LLM 问答，而是把复杂问题拆成 DAG 子任务，通过 Agent tool-calling loop 调用搜索、论文、官方文档、网页浏览、wiki 记忆等工具，最后生成带证据分级和 trace 记录的结构化研究报告。
+- 通用问题走 Core DeepResearch 流程。
+- 专业领域通过 **Domain Adapter** 注入领域关键词、工具偏好、可信来源、证据规则和输出结构。
+- 官方来源搜索结果会自动升级为页面级官方证据，进入 evidence store 和 trace 可视化。
+
+GIS/遥感只是内置示例 adapter。金融、气候政策、医疗指南、标准规范、公司研究等领域可以用同一套机制扩展。
 
 ![Trace report preview](docs/assets/trace-report-preview.svg)
 
-## 项目目标
-
-普通 LLM 生成研究报告时常见的问题是：内容看起来完整，但来源不清楚、方法是否可靠无法判断、长上下文下容易混入错误信息。这个项目主要解决三个问题：
-
-1. **证据可追踪**：结论尽量关联网页、论文、官方文档或历史 wiki 知识。
-2. **上下文可控**：对过长工具结果做预算控制，减少 context rot 和注意力稀释。
-3. **领域能力可插拔**：通用模式不绑定具体领域；专业领域通过 Domain Adapter 注入关键词、工具偏好、可信域名、证据规则、输出章节和领域风险检查。
-
-## 核心能力
+## 核心亮点
 
 | 能力 | 说明 |
 |---|---|
-| Planner DAG | 将复杂研究问题拆解成带依赖关系的子任务。 |
-| Orchestrator | 用状态机管理研究流程，调度可执行的 DAG 任务。 |
-| Agent 执行器 | 绑定模型 policy、prompt builder、工具注册表、loop 配置、memory adapter 和 trace recorder。 |
-| Tool-calling loop | 由 LLM 选择工具和 JSON 参数，由 loop 执行工具、追加上下文并控制终止条件。 |
-| 多模型配置 | 用 `providers -> profiles -> module_profiles` 拆分服务商、模型参数和模块路由。 |
-| Evidence Store | 记录证据等级、来源层级、URL、置信度线索和被拒绝结论。 |
-| 工具结果 compact | 对超预算工具结果做截断或压缩，并保留错误信息与 `[compact]` 标记。 |
-| Wiki 长期记忆 | 使用 LLM 结构化 ingest，把高质量报告转成可复用知识。 |
-| Trace 可观测性 | 输出 JSONL trace 和 HTML 可视化报告，记录 LLM 调用、usage、工具调用、状态迁移和证据事件。 |
-| Domain Adapter Framework | 通过内置或用户声明式 adapter 切换通用 DeepResearch 和专业领域增强 DeepResearch。 |
+| Planner DAG | 将复杂研究问题拆成带依赖关系的子任务 DAG。 |
+| Orchestrator | 用状态机调度 DAG，基于 asyncio 控制并发执行。 |
+| Agent Executor | 每个 agent 绑定 policy、prompt builder、tool registry、loop config、memory adapter 和 trace recorder。 |
+| ToolCallingLoop | 负责 messages、tool calls、工具执行、终止条件、结果 compact 和 trace。 |
+| Domain Adapter | 领域能力插件化：注入关键词、工具集合、官方域名、证据规则和报告结构。 |
+| Official Evidence Auto-Fetch | `official_source_search` 命中官方 URL 后，自动调用 `official_doc_fetcher` 抽取页面级证据。 |
+| Evidence Store | 按来源质量和工具轨迹标注 `verified`、`evidence_backed`、`speculative`、`rejected`。 |
+| Wiki Memory | 把高质量报告通过 LLM 结构化 ingest 到本地 wiki，供后续任务复用。 |
+| Trace 可观测性 | 输出 JSONL trace 和 HTML 报告，展示 DAG、工具调用、usage、证据等级、compact 和 wiki ingest。 |
+| 多模型配置 | 使用 `providers -> profiles -> module_profiles` 三层结构，为 planner、researcher、summarizer 等模块配置不同模型。 |
 
-## 系统架构
+## 架构
 
 ```mermaid
 flowchart TD
-    subgraph Config["配置层"]
-        C1["model.providers"]
-        C2["model.profiles"]
-        C3["model.module_profiles"]
-        C4["domain adapter"]
-        C5["output.language"]
-    end
+    User["User Query"] --> Runner["Runner"]
+    Runner --> Adapter["Domain Adapter Resolver"]
+    Runner --> Planner["Planner"]
+    Adapter --> Profile["Resolved Domain Profile"]
+    Profile --> AgentPool["AgentPool"]
+    Planner --> DAG["Task DAG"]
+    DAG --> Orchestrator["Orchestrator State Machine"]
+    Orchestrator --> AgentPool
+    AgentPool --> Agent["Agent Executor"]
+    Agent --> Prompt["Prompt Builder"]
+    Agent --> Registry["Tool Registry"]
+    Agent --> Loop["ToolCallingLoop"]
 
-    subgraph Core["Core DeepResearch"]
-        R["Runner"]
-        P["Planner"]
-        O["Orchestrator State Machine"]
-        AP["AgentPool"]
-        AG["Agent Executor"]
-        TL["ToolCallingLoop"]
-        ES["Evidence Store"]
-        TR["Trace Recorder"]
-        MEM["Memory / Wiki Store"]
-    end
+    Loop --> Web["web_search"]
+    Loop --> Paper["paper_search"]
+    Loop --> OfficialSearch["official_source_search"]
+    OfficialSearch --> AutoFetch["Official Evidence Auto-Fetch"]
+    AutoFetch --> OfficialFetch["official_doc_fetcher"]
+    Loop --> Browser["browser"]
+    Loop --> WikiSearch["wiki_search"]
+    Loop --> Calculator["calculator"]
 
-    subgraph Tooling["工具层"]
-        WS["web_search"]
-        PS["paper_search"]
-        OS["official_source_search"]
-        OD["official_doc_fetcher"]
-        BR["browser"]
-        WK["wiki_search"]
-        CS["code_sandbox"]
-    end
+    Web --> Evidence["Evidence Store"]
+    Paper --> Evidence
+    OfficialSearch --> Evidence
+    OfficialFetch --> Evidence
+    Browser --> Evidence
+    WikiSearch --> Evidence
 
-    C1 --> R
-    C2 --> R
-    C3 --> R
-    C4 --> AP
-    C5 --> AG
-    R --> P
-    P --> O
-    O --> AP
-    AP --> AG
-    AG --> TL
-    TL --> Tooling
-    Tooling --> ES
-    ES --> TR
-    ES --> MEM
-    O --> TR
+    Evidence --> Summary["Summarizer"]
+    Evidence --> Trace["Trace Recorder"]
+    Summary --> Report["Final Report"]
+    Report --> Wiki["Wiki Ingest"]
 ```
 
 ## Agent 执行流程
 
 ```mermaid
 sequenceDiagram
-    participant User
-    participant Planner
-    participant Orchestrator
-    participant Agent
-    participant TLoop as ToolCallingLoop
-    participant Tools
-    participant Evidence
-    participant Summary
-    participant Wiki
+    participant U as User
+    participant P as Planner
+    participant O as Orchestrator
+    participant A as Agent
+    participant L as ToolCallingLoop
+    participant S as official_source_search
+    participant F as official_doc_fetcher
+    participant E as EvidenceStore
+    participant T as Trace
+    participant R as Report
 
-    User->>Planner: 提交研究问题
-    Planner->>Orchestrator: 返回 DAG 子任务
-    Orchestrator->>Agent: 分发可执行任务
-    Agent->>TLoop: 构造 prompt、工具集合、记忆和上下文预算
-    TLoop->>Tools: 调用 LLM 选择的工具和 JSON 参数
-    Tools->>TLoop: 返回搜索、论文、官方文档或 wiki 结果
-    TLoop->>Evidence: 写入证据和置信度线索
-    Agent->>Orchestrator: 返回任务结果
-    Orchestrator->>Summary: 汇总所有任务结果
-    Summary->>User: 生成 evidence-aware 报告
-    Summary->>Wiki: 将高质量知识写入长期记忆
+    U->>P: 提交研究问题
+    P->>O: 返回 DAG 子任务
+    O->>A: 分发可执行任务
+    A->>L: 构造 system prompt、user prompt、工具集合和记忆上下文
+    L->>S: LLM 选择官方来源搜索
+    S-->>L: 返回官方 URL 候选
+    L->>F: 自动抓取 top official URL
+    F-->>L: 返回页面正文片段和 claim_support
+    L->>E: 写入工具轨迹和证据信息
+    L->>T: 记录 tool_call、tool_result、official_auto_fetch 事件
+    A-->>O: 返回子任务结果
+    O->>R: 汇总生成最终报告
 ```
 
-## Demo 输出
+## Domain Adapter 机制
+
+Domain Adapter 负责把“专业领域”变成可插拔配置，而不是把领域逻辑写死在主流程里。一个 adapter 可以定义：
+
+- `keywords`：用于 `--adapter auto` 时自动匹配领域。
+- `exposed_tools` / `recommended_tools`：控制该领域可以使用和优先使用的工具。
+- `preferred_official_domains`：官方来源偏好，例如 `usgs.gov`、`sec.gov`、`ipcc.ch`。
+- `evidence_checklist`：领域证据规则，例如“数据集参数必须查官方文档”。
+- `output_sections`：领域报告结构，例如“数据候选表”“风险清单”“方法验证矩阵”。
+- `extends`：继承通用 adapter，避免重复声明通用工具和规则。
+
+当前内置 adapter：
+
+| Adapter | 作用 |
+|---|---|
+| `general` | 通用 DeepResearch，不注入特定领域假设。 |
+| `geo_remote_sensing` | GIS/遥感增强，注入遥感数据规则、官方数据源、方法验证和风险检查。 |
+
+运行时选择 adapter：
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 scripts\run_geo_integration_demo.py --preset general --adapter general
+.\.venv\Scripts\python.exe -X utf8 scripts\run_geo_integration_demo.py --preset geo --adapter geo_remote_sensing
+.\.venv\Scripts\python.exe -X utf8 scripts\run_geo_integration_demo.py --preset general --adapter auto --query "如何用 Landsat 研究城市热岛？"
+```
+
+## 如何扩展新领域
+
+项目支持两种扩展方式。
+
+### 方式一：用户声明式 Adapter
+
+适合快速创建一个新领域，不需要改源码。生成结果是 `data/user_adapters/<adapter_id>.yaml`。
+
+#### Level 1：LLM 快速生成
+
+只提供领域 id、展示名和一句话描述，让 LLM 生成第一版 adapter 草稿。
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 scripts\create_domain_adapter.py `
+  --name climate_policy `
+  --display-name "Climate Policy" `
+  --description "面向气候政策、IPCC 报告、国际组织文件和政策证据的深度研究 adapter。"
+```
+
+适合场景：
+
+- 快速验证某个新领域是否能接入。
+- 先得到一版可运行配置，再人工微调。
+- 面试展示“用户可自定义专业领域”的能力。
+
+#### Level 2：手动字段填写
+
+手动指定关键词、可信域名、推荐工具、证据规则和输出结构。
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 scripts\create_domain_adapter.py `
+  --manual `
+  --name finance_research `
+  --display-name "Finance Research" `
+  --description "Financial market, public company, macroeconomic, and regulatory research." `
+  --keywords "finance,stock,earnings,SEC,10-K,10-Q,Federal Reserve,macro,valuation,risk" `
+  --preferred-domains "sec.gov,federalreserve.gov,treasury.gov,bls.gov,bea.gov" `
+  --recommended-tools "official_source_search,official_doc_fetcher,web_search,paper_search,calculator" `
+  --evidence-rules "Prefer official filings and regulators,Flag stale market data,Separate facts from investment interpretation" `
+  --output-sections "Financial facts table,Source and filing table,Risk and uncertainty,Investment interpretation boundaries"
+```
+
+适合场景：
+
+- 你已经知道这个领域应该信哪些官方来源。
+- 需要稳定复现，而不是依赖 LLM 每次生成。
+- 希望精确控制报告结构。
+
+运行用户 adapter：
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 scripts\run_geo_integration_demo.py `
+  --preset general `
+  --adapter finance_research `
+  --user-adapters-dir data/user_adapters `
+  --query "请分析苹果公司最近一个财年的收入结构、主要风险和监管披露重点。"
+```
+
+说明：金融 adapter 已验证“快速创建、保存、加载、运行”的链路。当前版本还没有 SEC EDGAR 专用 connector，所以高质量金融研究仍属于后续 Official Evidence Layer 的扩展方向。
+
+### 方式二：内置代码 Adapter
+
+适合把一个领域沉淀为项目内置能力。它需要改源码，但可维护性更强，适合长期展示或产品化。
+
+步骤：
+
+1. 新增 adapter 文件，例如：
+
+```text
+src/domain_adapters/builtin/medical_guidelines.py
+```
+
+2. 继承 `StaticProfileAdapter`：
+
+```python
+from src.domain_adapters.base import DomainAdapterMetadata, StaticProfileAdapter
+
+MEDICAL_GUIDELINES_PROFILE = {
+    "extends": "general",
+    "recommended_tools": [
+        "official_source_search",
+        "official_doc_fetcher",
+        "paper_search",
+        "web_search",
+    ],
+    "preferred_official_domains": [
+        "who.int",
+        "cdc.gov",
+        "nih.gov",
+    ],
+    "evidence_checklist": [
+        "Prefer official clinical guidelines and public health agencies.",
+        "Separate guideline recommendations from interpretation.",
+        "Flag date-sensitive or region-specific claims.",
+    ],
+    "output_sections": [
+        "Guideline source table",
+        "Evidence summary",
+        "Risks and limitations",
+    ],
+}
+
+class MedicalGuidelinesAdapter(StaticProfileAdapter):
+    def __init__(self) -> None:
+        super().__init__(
+            metadata=DomainAdapterMetadata(
+                name="medical_guidelines",
+                display_name="Medical Guidelines",
+                description="Evidence-aware research over medical guidelines.",
+                keywords=("medical guideline", "WHO", "CDC", "NIH"),
+            ),
+            profile=MEDICAL_GUIDELINES_PROFILE,
+        )
+```
+
+3. 在 `src/domain_adapters/builtin/__init__.py` 导出新类。
+
+4. 在 `src/domain_adapters/registry.py` 的 `ensure_builtins()` 中注册。
+
+5. 补单元测试，确认：
+
+- `AdapterRegistry.get("medical_guidelines")` 可用。
+- `--adapter auto` 能根据关键词匹配。
+- `resolve_domain_profile()` 能合并 `extends=general` 的工具和规则。
+
+这种方式适合 GIS/遥感这类你希望长期维护、在 README 里重点展示的领域。
+
+## Official Evidence Auto-Fetch
+
+当前版本已经实现一个轻量但有效的官方证据闭环：
+
+```text
+official_source_search
+  -> 找到官方 URL
+  -> ToolCallingLoop 自动调用 official_doc_fetcher
+  -> 抽取官方页面正文片段
+  -> 写入 trajectory 和 trace
+  -> EvidenceStore 识别为 official_doc evidence
+```
+
+默认配置：
+
+```yaml
+agents:
+  researcher:
+    tool_loop:
+      auto_fetch_official_docs: true
+      auto_fetch_official_max_urls: 1
+      auto_fetch_official_timeout_seconds: 12
+      auto_fetch_official_max_chars: 6000
+      auto_fetch_official_max_snippets: 3
+```
+
+这不是完整的 Official Evidence Layer，但已经避免了“只把搜索摘要当证据”的问题。后续可以继续扩展：
+
+- `sec_edgar`：SEC 10-K / 10-Q / 8-K 文件检索与解析。
+- `government_site`：政府法规、统计发布、白皮书。
+- `standards_org`：标准组织文档。
+- `company_ir`：公司年报、投资者关系材料。
+- `product_docs`：技术文档、API 文档、数据集说明。
+
+## Demo 结果
 
 ![Report preview](docs/assets/report-preview.svg)
 
-一次 GIS/遥感 demo 的 trace 摘要示例：
+最近一轮 GIS/RS demo：
 
-| 指标 | 示例值 |
+| 指标 | 结果 |
 |---|---:|
-| Trace events | 95 |
-| Tool calls | 12 |
-| `evidence_backed` 证据项 | 12 |
-| `speculative` 证据项 | 4 |
-| `rejected` 证据项 | 1 |
-| Wiki structured ingest | completed |
+| Trace events | 97 |
+| Task success | 4 / 4 |
+| Tool calls | 13 |
+| `official_source_search` | 7 |
+| `official_doc_fetcher` | 2 |
+| `paper_search` | 2 |
+| `evidence_backed` | 11 |
+| `speculative` | 2 |
+| Wiki structured ingest | 8 pages |
 
-报告片段：[docs/demo/sample_report_excerpt.md](docs/demo/sample_report_excerpt.md)
-
-每次运行会在 `outputs/<run-id>/` 下生成：
+输出目录示例：
 
 ```text
-report_*.md                 # 最终研究报告
-trace.jsonl                 # 原始 trace 事件
-trace_report.html           # 可视化 trace 报告
-progress_events.jsonl       # 面向未来 SSE 前端的进度事件
-integration_summary.json    # 本次运行摘要
+outputs/official_auto_fetch_geo_01/
+  report_*.md
+  trace.jsonl
+  trace_report.html
+  progress_events.jsonl
+  integration_summary.json
 ```
-
-`outputs/` 默认不提交到 Git，只在 `docs/` 中保留经过整理的展示素材。
 
 ## 快速开始
 
@@ -145,7 +318,7 @@ python -m pip install -r requirements-minimal.txt
 python -m pip install -e . --no-deps
 ```
 
-如果要启用语义记忆和 wiki 检索，需要安装 ML 依赖：
+如果要启用语义记忆和 wiki 检索：
 
 ```powershell
 python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
@@ -169,7 +342,7 @@ DEEPSEEK_BASE_URL=https://api.deepseek.com/v1
 DEEPSEEK_MODEL=deepseek-chat
 ```
 
-搜索工具可根据配置使用 Bocha、SerpAPI、Bing Search 或 Metaso。真实密钥只应写入 `.env` 或 `.env.local`，这两个文件已被 Git 忽略。
+搜索工具可以使用 Bocha、SerpAPI、Bing Search 或 Metaso。真实密钥只应写入 `.env` 或 `.env.local`，不要提交到 GitHub。
 
 ## 运行 Demo
 
@@ -185,141 +358,68 @@ GIS/遥感增强 DeepResearch：
 .\.venv\Scripts\python.exe -X utf8 scripts\run_geo_integration_demo.py --preset geo
 ```
 
-自定义问题：
-
-```powershell
-.\.venv\Scripts\python.exe -X utf8 scripts\run_geo_integration_demo.py --preset geo --query "如何结合 Landsat 和 MODIS 分析城市热岛变化？"
-```
-
-自动选择 adapter：
+指定输出目录：
 
 ```powershell
 .\.venv\Scripts\python.exe -X utf8 scripts\run_geo_integration_demo.py `
-  --preset general `
-  --adapter auto `
-  --query "如何用 Sentinel-2 和 Landsat 数据评估城市扩张对热环境的影响？"
+  --preset geo `
+  --output-dir outputs\demo_geo_showcase_01
 ```
 
-指定用户自定义 adapter：
+## 多模型配置
 
-```powershell
-.\.venv\Scripts\python.exe -X utf8 scripts\run_geo_integration_demo.py `
-  --preset general `
-  --adapter climate_policy `
-  --user-adapters-dir data/user_adapters `
-  --query "请调研 IPCC AR6 中关于城市适应政策的关键结论。"
-```
-
-## 配置说明
-
-### Domain Adapter
-
-运行时通过 `domain_adapter` 决定专业领域增强逻辑：
-
-```yaml
-domain_adapter:
-  mode: "general"
-  user_adapters_dir: "data/user_adapters"
-```
-
-内置 adapter：
-
-| Adapter | 用途 |
-|---|---|
-| `general` | 通用深度研究，不注入特定领域规则。 |
-| `geo_remote_sensing` | GIS/遥感增强，注入数据约束、官方域名、方法验证规则和风险清单。 |
-
-`geo_remote_sensing` 会额外要求报告覆盖：
-
-- 研究约束抽取：AOI、时间范围、目标变量、候选传感器、方法需求。
-- 数据候选表：数据集、用途、空间分辨率、时间覆盖、获取方式、官方来源。
-- 数据-方法适配矩阵：方法、数据条件、候选数据是否支持、不支持原因、风险。
-- GIS/RS 风险清单：云量、CRS、尺度错配、季节一致性、混合像元、热红外限制。
-
-### 创建用户 Adapter
-
-Level 1：使用 LLM 根据一句话描述生成 adapter 草稿：
-
-```powershell
-.\.venv\Scripts\python.exe -X utf8 scripts\create_domain_adapter.py `
-  --name climate_policy `
-  --display-name "Climate Policy" `
-  --description "面向气候政策、IPCC 报告、国际组织文件和政策证据的深度研究 adapter。"
-```
-
-Level 2：手动填写字段，适合没有可用 LLM 或想精确控制 adapter 的情况：
-
-```powershell
-.\.venv\Scripts\python.exe -X utf8 scripts\create_domain_adapter.py `
-  --manual `
-  --name climate_policy `
-  --display-name "Climate Policy" `
-  --description "Climate policy research." `
-  --keywords "climate policy,IPCC,UNFCCC" `
-  --preferred-domains "ipcc.ch,unfccc.int" `
-  --recommended-tools "official_source_search,official_doc_fetcher,paper_search,web_search" `
-  --evidence-rules "Prefer official reports and standards bodies,Separate policy claims from interpretation" `
-  --output-sections "Policy source table,Evidence summary,Risk and uncertainty"
-```
-
-生成的 YAML 位于 `data/user_adapters/<adapter_id>.yaml`。该目录默认不提交到 Git，避免把个人实验配置混入项目源码。
-
-### 输出语言
-
-```yaml
-output:
-  language: "zh-CN"
-```
-
-当前支持 `zh-CN` 和 `en-US`。该配置会传入 researcher prompt、summarizer prompt 和 wiki ingest prompt。
-
-### 三层模型配置
+模型配置分三层：
 
 ```yaml
 model:
-  default_profile: "solver"
-
   providers:
     deepseek:
       adapter: "openai_compatible"
-      env_prefix: "DEEPSEEK"
-      default_model: "deepseek-chat"
-      default_base_url: "https://api.deepseek.com/v1"
-
+      base_url_env: "DEEPSEEK_BASE_URL"
+      api_key_env: "DEEPSEEK_API_KEY"
   profiles:
     planner:
       provider: "deepseek"
       model: "deepseek-chat"
       temperature: 0.2
-      max_tokens: 4096
-    solver:
-      provider: "deepseek"
-      model: "deepseek-chat"
-      temperature: 0.5
-      max_tokens: 4096
-    summarizer:
-      provider: "deepseek"
-      model: "deepseek-chat"
-      temperature: 0.2
-      max_tokens: 8192
-
   module_profiles:
     planner: "planner"
-    researcher: "solver"
+    solver: "solver"
     summarizer: "summarizer"
 ```
 
-这套配置将三类信息分开：
+面试时可以这样讲：
 
-- `providers`：API 服务商、adapter、环境变量前缀、默认模型和 base URL。
-- `profiles`：模型名、temperature、top_p、max_tokens 等调用参数。
-- `module_profiles`：planner、researcher、summarizer 等模块使用哪个 profile。
+> provider 管 API 服务商、base_url 和密钥；profile 管模型名、temperature、max_tokens 等参数；module_profiles 决定 planner、researcher、summarizer 等模块使用哪个 profile。这样可以让不同模块使用不同模型，同时避免把 API key 和模块逻辑耦合在一起。
 
 ## 测试
 
+全量单测：
+
 ```powershell
-.\.venv\Scripts\python.exe -X utf8 -m unittest discover -s tests/unit -p "test_*.py"
-.\.venv\Scripts\python.exe -X utf8 -m compileall -q src tests
+.\.venv\Scripts\python.exe -X utf8 -m unittest discover -s tests\unit -p "test_*.py"
 ```
 
-当前测试覆盖模型配置、domain adapter、prompt builder、工具结果 compact、证据来源分级、搜索结果排序、官方文档获取、trace 记录、wiki store 和 summarizer confidence 等关键模块。
+常用 targeted tests：
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m unittest `
+  tests.unit.test_domain_adapters `
+  tests.unit.test_create_domain_adapter `
+  tests.unit.test_tool_calling_loop_trace `
+  tests.unit.test_tool_profiles
+```
+
+最近验证结果：
+
+```text
+129 tests OK
+general demo: official_doc_fetcher = 5
+GIS/RS demo: official_doc_fetcher = 2
+```
+
+## 当前边界
+
+- 当前官方证据能力是“官方来源自动升级”，不是完整 SEC / PDF / XBRL / 表格级官方文档系统。
+- 用户 adapter 可以快速扩展领域，但高质量专业研究仍需要为关键来源补 connector。
+- `outputs/`、`data/`、`.env`、`.env.local` 不应提交到 GitHub。

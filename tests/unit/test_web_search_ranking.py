@@ -113,6 +113,135 @@ class WebSearchRankingTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(item["_source_tier"] == "official" for item in result["results"]))
         self.assertTrue(all(item["_quality_score"] >= 95.0 for item in result["results"]))
 
+    def test_official_source_search_routes_landsat_query_to_usgs_and_nasa(self):
+        tool = OfficialSourceSearchTool(search_tool=DummySearchTool(), max_domain_queries=4)
+
+        domains = tool._select_domains("Landsat 8 TIRS surface temperature product")
+
+        self.assertIn("usgs.gov", domains)
+        self.assertIn("landsat.gsfc.nasa.gov", domains)
+        self.assertIn("nasa.gov", domains)
+
+    def test_official_source_search_routes_sentinel_query_to_esa_and_copernicus(self):
+        tool = OfficialSourceSearchTool(search_tool=DummySearchTool(), max_domain_queries=4)
+
+        domains = tool._select_domains("Sentinel-2 MSI bands NDVI NDBI")
+
+        self.assertIn("sentinels.copernicus.eu", domains)
+        self.assertIn("sentiwiki.copernicus.eu", domains)
+        self.assertIn("esa.int", domains)
+
+    def test_official_source_search_route_domains_beat_preferred_domains(self):
+        tool = OfficialSourceSearchTool(
+            search_tool=DummySearchTool(),
+            max_domain_queries=4,
+            preferred_domains=["usgs.gov", "landsat.gsfc.nasa.gov", "nasa.gov", "lpdaac.usgs.gov"],
+        )
+
+        domains = tool._select_domains("Sentinel-2 MSI bands thermal infrared surface temperature")
+
+        self.assertEqual(domains[0], "sentinels.copernicus.eu")
+        self.assertIn("esa.int", domains)
+        self.assertNotEqual(domains[:4], ["usgs.gov", "landsat.gsfc.nasa.gov", "nasa.gov", "lpdaac.usgs.gov"])
+
+    def test_official_source_search_routes_gee_query_to_google_docs(self):
+        tool = OfficialSourceSearchTool(search_tool=DummySearchTool(), max_domain_queries=2)
+
+        domains = tool._select_domains("Google Earth Engine Landsat LST workflow")
+
+        self.assertIn("developers.google.com/earth-engine", domains)
+
+    def test_official_source_search_routes_general_python_query_to_python_docs(self):
+        tool = OfficialSourceSearchTool(search_tool=DummySearchTool(), max_domain_queries=3)
+
+        domains = tool._select_domains("Python asyncio task cancellation official docs")
+
+        self.assertEqual(domains[0], "docs.python.org")
+
+    def test_official_source_search_routes_openai_query_to_openai_docs(self):
+        tool = OfficialSourceSearchTool(search_tool=DummySearchTool(), max_domain_queries=3)
+
+        domains = tool._select_domains("OpenAI Responses API official documentation")
+
+        self.assertIn("platform.openai.com", domains)
+
+    async def test_official_source_search_uses_query_variants_and_broad_fallback(self):
+        backend = FakeOfficialBackend({
+            "Sentinel-2 MSI bands thermal infrared site:sentinels.copernicus.eu": [],
+            "Sentinel-2 MSI bands thermal infrared site:sentiwiki.copernicus.eu": [],
+            "Sentinel-2 MSI spectral bands thermal infrared official documentation site:sentinels.copernicus.eu": [],
+            "Sentinel-2 MSI spectral bands thermal infrared official documentation site:sentiwiki.copernicus.eu": [],
+            "Sentinel-2 MSI bands thermal infrared": [
+                {
+                    "title": "Blog result",
+                    "url": "https://example.com/sentinel-2-msi",
+                    "snippet": "Should be filtered out.",
+                },
+                {
+                    "title": "Sentinel-2 MSI Instrument",
+                    "url": "https://sentiwiki.copernicus.eu/web/s2-mission",
+                    "snippet": "Official Sentinel-2 MSI mission documentation.",
+                },
+            ],
+        })
+        tool = OfficialSourceSearchTool(
+            search_tool=backend,
+            max_domain_queries=2,
+            max_query_variants=2,
+        )
+
+        result = await tool.execute("Sentinel-2 MSI bands thermal infrared", top_n=3)
+
+        urls = [item["url"] for item in result["results"]]
+        self.assertIn("https://sentiwiki.copernicus.eu/web/s2-mission", urls)
+        self.assertNotIn("https://example.com/sentinel-2-msi", urls)
+        self.assertIn("Sentinel-2 MSI spectral bands thermal infrared official documentation", result["query_variants"])
+        self.assertIn("Sentinel-2 MSI bands thermal infrared", result["attempted_queries"])
+
+    async def test_official_source_search_rejects_wrong_sensor_even_on_official_domain(self):
+        backend = FakeOfficialBackend({
+            "Sentinel-2 MSI bands thermal infrared site:sentinels.copernicus.eu": [],
+            "Sentinel-2 MSI bands thermal infrared site:sentiwiki.copernicus.eu": [],
+            "Sentinel-2 MSI bands thermal infrared": [
+                {
+                    "title": "Land-surface temperature from Copernicus Sentinel-3",
+                    "url": "https://www.esa.int/ESA_Multimedia/Images/2019/07/Land-surface_temperature_from_Copernicus_Sentinel-3",
+                    "snippet": "Official ESA page about Sentinel-3 land surface temperature.",
+                },
+                {
+                    "title": "Sentinel-2 MSI mission",
+                    "url": "https://sentiwiki.copernicus.eu/web/s2-mission",
+                    "snippet": "Official Sentinel-2 MSI mission documentation.",
+                },
+            ],
+        })
+        tool = OfficialSourceSearchTool(
+            search_tool=backend,
+            max_domain_queries=2,
+            max_query_variants=1,
+        )
+
+        result = await tool.execute("Sentinel-2 MSI bands thermal infrared", top_n=3)
+
+        urls = [item["url"] for item in result["results"]]
+        self.assertNotIn(
+            "https://www.esa.int/ESA_Multimedia/Images/2019/07/Land-surface_temperature_from_Copernicus_Sentinel-3",
+            urls,
+        )
+        self.assertIn("https://sentiwiki.copernicus.eu/web/s2-mission", urls)
+
+    async def test_official_source_search_respects_total_attempt_budget(self):
+        tool = OfficialSourceSearchTool(
+            search_tool=FakeOfficialBackend({}),
+            max_domain_queries=4,
+            max_query_variants=2,
+            max_attempts=3,
+        )
+
+        result = await tool.execute("Sentinel-2 MSI bands thermal infrared", top_n=3)
+
+        self.assertLessEqual(len(result["attempted_queries"]), 3)
+
 
 if __name__ == "__main__":
     unittest.main()

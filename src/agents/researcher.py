@@ -44,12 +44,14 @@ class ResearcherAgent(BaseAgent):
         pool_type_key: str | None = None,
         loop_config: ToolLoopConfig | None = None,
         external_prefetch_config: dict[str, Any] | None = None,
+        domain_profile: dict[str, Any] | None = None,
         trace_recorder=None,
         progress_callback=None,
     ) -> None:
         super().__init__(name, policy, tools, pool_type_key=pool_type_key)
         self.max_turns = max_turns
-        self.prompt_builder = ResearchPromptBuilder()
+        self.domain_profile = domain_profile or {}
+        self.prompt_builder = ResearchPromptBuilder(domain_profile=self.domain_profile)
         self.tool_registry = ToolRegistry(tools)
         self.loop_config = loop_config or ToolLoopConfig(max_turns=max_turns)
         self.external_prefetch_config = external_prefetch_config or {}
@@ -61,7 +63,7 @@ class ResearcherAgent(BaseAgent):
     @trace_agent(name="researcher.run", tags=["agent", "researcher"])
     async def run(self, task: SubTask, context: dict) -> AgentResult:
         """Execute one SubTask with a fresh loop runtime."""
-        task_prompt = self.prompt_builder.task_prompt(task, context)
+        task_prompt = self.prompt_builder.task_prompt(task, context, available_tools=self.tool_registry.tools)
 
         if self.prompt_builder.is_non_searchable(task, context):
             return await self._run_direct_analysis(task, task_prompt)

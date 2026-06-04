@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 from .arxiv_reader import ArxivReaderTool
+from ..utils.text_cleanup import normalize_snippet
 
 
 class PaperSearchTool:
@@ -84,9 +85,9 @@ class PaperSearchTool:
         url = paper.get("pdf_url", "") or paper.get("url", "")
         return {
             "id": paper.get("id", ""),
-            "title": paper.get("title", ""),
+            "title": normalize_snippet(paper.get("title", "")),
             "authors": paper.get("authors", []),
-            "summary": paper.get("summary", "") or paper.get("abstract", ""),
+            "summary": normalize_snippet(paper.get("summary", "") or paper.get("abstract", "")),
             "published": paper.get("published", "") or paper.get("year", ""),
             "url": url,
             "pdf_url": paper.get("pdf_url", ""),

@@ -24,6 +24,7 @@ import aiohttp
 
 from ..utils.env_config import get_env
 from ..utils.domain_tiers import authority_score, classify_url
+from ..utils.text_cleanup import normalize_snippet
 
 __all__ = ["WebSearchTool", "MockWebSearchTool", "OfficialSourceSearchTool", "BaseWebSearchTool"]
 
@@ -75,9 +76,7 @@ class BaseWebSearchTool(ABC):
         return item
 
     def _truncate_snippet(self, snippet: str) -> str:
-        if len(snippet) <= self.MAX_SNIPPET_CHARS:
-            return snippet
-        return snippet[: self.MAX_SNIPPET_CHARS].rstrip()
+        return normalize_snippet(snippet, max_chars=self.MAX_SNIPPET_CHARS)
 
     def _query_terms(self, query: str) -> set[str]:
         return {term for term in re.findall(r"[a-zA-Z0-9_\-]{3,}", query.lower())}
@@ -618,11 +617,82 @@ class OfficialSourceSearchTool:
         "copernicus.eu",
         "developers.google.com/earth-engine",
         "planetarycomputer.microsoft.com",
+        "docs.python.org",
+        "pip.pypa.io",
+        "pandas.pydata.org",
+        "numpy.org",
+        "developer.mozilla.org",
+        "docs.github.com",
+        "learn.microsoft.com",
+        "cloud.google.com",
+        "docs.aws.amazon.com",
+        "platform.openai.com",
+        "openai.com",
+    ]
+    domain_routes = [
+        (
+            ("python", "pip", "asyncio", "pandas", "numpy"),
+            ["docs.python.org", "pip.pypa.io", "pandas.pydata.org", "numpy.org"],
+        ),
+        (
+            ("javascript", "html", "css", "web api", "browser api", "mdn"),
+            ["developer.mozilla.org"],
+        ),
+        (
+            ("github", "github actions", "pull request", "git"),
+            ["docs.github.com"],
+        ),
+        (
+            ("openai", "chatgpt", "responses api", "assistants api", "openai api"),
+            ["platform.openai.com", "openai.com"],
+        ),
+        (
+            ("azure", "microsoft", "windows", "powershell", "typescript"),
+            ["learn.microsoft.com"],
+        ),
+        (
+            ("aws", "s3", "lambda", "bedrock"),
+            ["docs.aws.amazon.com"],
+        ),
+        (
+            ("google cloud", "gcp", "bigquery", "vertex ai"),
+            ["cloud.google.com"],
+        ),
+        (
+            ("google earth engine", "earth engine", "gee"),
+            ["developers.google.com/earth-engine"],
+        ),
+        (
+            ("sentinel", "sentinel-2", "copernicus", "msi"),
+            ["sentinels.copernicus.eu", "sentiwiki.copernicus.eu", "esa.int", "copernicus.eu"],
+        ),
+        (
+            ("landsat", "tirs", "oli", "surface temperature"),
+            ["usgs.gov", "landsat.gsfc.nasa.gov", "nasa.gov", "lpdaac.usgs.gov"],
+        ),
+        (
+            ("worldcover", "esa worldcover"),
+            ["esa-worldcover.org", "esa.int"],
+        ),
+        (
+            ("modis", "mod11", "ecostress", "lp daac", "lpdaac"),
+            ["lpdaac.usgs.gov", "nasa.gov", "modis.gsfc.nasa.gov"],
+        ),
     ]
 
-    def __init__(self, search_tool: WebSearchTool | None = None, max_domain_queries: int = 4) -> None:
+    def __init__(
+        self,
+        search_tool: WebSearchTool | None = None,
+        max_domain_queries: int = 4,
+        max_query_variants: int = 2,
+        max_attempts: int = 6,
+        preferred_domains: list[str] | None = None,
+    ) -> None:
         self.search_tool = search_tool or WebSearchTool()
         self.max_domain_queries = max_domain_queries
+        self.max_query_variants = max_query_variants
+        self.max_attempts = max_attempts
+        self.preferred_domains = self._deduplicate_domains(preferred_domains or [])
 
     def get_openai_tool_schema(self) -> dict:
         return {
@@ -652,31 +722,50 @@ class OfficialSourceSearchTool:
         top_n: int = 5,
         domains: list[str] | None = None,
     ) -> dict[str, Any]:
-        selected_domains = (domains or self.default_domains)[:self.max_domain_queries]
+        selected_domains = self._select_domains(query, domains)
         per_domain = max(1, min(3, top_n))
-        merged: list[dict[str, Any]] = self._curated_official_sources(query)
+        merged: list[dict[str, Any]] = []
         errors: list[str] = []
+        attempted_domains: list[str] = []
+        attempted_queries: list[str] = []
+        query_variants = self._query_variants(query)
+        site_attempt_budget = max(1, self.max_attempts - len(query_variants))
 
-        for domain in selected_domains:
-            domain_query = f"{query} site:{domain}"
-            result = await self.search_tool.execute(domain_query, top_n=per_domain)
-            if result.get("error"):
-                errors.append(f"{domain}: {result['error']}")
-                continue
-            for item in result.get("results", []):
-                if not isinstance(item, dict):
+        for variant in query_variants:
+            for domain in selected_domains:
+                if len(attempted_queries) >= site_attempt_budget:
+                    break
+                attempted_domains.append(domain)
+                domain_query = f"{variant} site:{domain}"
+                attempted_queries.append(domain_query)
+                result = await self.search_tool.execute(domain_query, top_n=per_domain)
+                if result.get("error"):
+                    errors.append(f"{domain}: {result['error']}")
                     continue
-                if not self._url_matches_domain(item.get("url", ""), domain):
+                self._collect_official_results(merged, result.get("results", []), selected_domains, variant)
+            if len(merged) >= top_n or len(attempted_queries) >= site_attempt_budget:
+                break
+
+        if len(merged) < top_n and len(attempted_queries) < self.max_attempts:
+            for variant in query_variants:
+                if len(attempted_queries) >= self.max_attempts:
+                    break
+                attempted_queries.append(variant)
+                result = await self.search_tool.execute(variant, top_n=max(top_n, per_domain))
+                if result.get("error"):
+                    errors.append(f"fallback: {result['error']}")
                     continue
-                normalized = dict(item)
-                normalized["official_domain"] = domain
-                normalized["source_type"] = "official"
-                merged.append(normalized)
+                self._collect_official_results(merged, result.get("results", []), selected_domains, variant)
+                if len(merged) >= top_n:
+                    break
 
         results = self.search_tool._rank_results(self.search_tool._deduplicate_results(merged), query, top_n=top_n)
         return {
             "query": query,
+            "query_variants": query_variants,
             "domains": selected_domains,
+            "attempted_domains": attempted_domains,
+            "attempted_queries": attempted_queries,
             "results": results,
             "total": len(results),
             "source": f"official_source_search:{getattr(self.search_tool, 'backend', self.search_tool.name)}",
@@ -684,32 +773,137 @@ class OfficialSourceSearchTool:
             "evidence_level": "evidence_backed" if results else "speculative",
         }
 
-    def _curated_official_sources(self, query: str) -> list[dict[str, Any]]:
-        """Return stable official URL seeds from the local GIS/RS registry."""
-        query_lower = query.lower()
-        results: list[dict[str, Any]] = []
-        try:
-            from .geo_registry import DATASETS
-        except Exception:
-            return results
+    def _select_domains(self, query: str, domains: list[str] | None = None) -> list[str]:
+        if domains:
+            return self._deduplicate_domains(domains)[:self.max_domain_queries]
 
-        for key, record in DATASETS.items():
-            aliases = [key] + record.get("aliases", [])
-            variables = record.get("variables", [])
-            if not any(str(token).lower() in query_lower for token in aliases + variables):
+        query_lower = query.lower()
+        route_matches: list[str] = []
+        for keywords, route_domains in self.domain_routes:
+            if any(keyword in query_lower for keyword in keywords):
+                route_matches.extend(route_domains)
+        routed: list[str] = []
+        routed.extend(route_matches)
+        routed.extend(self.preferred_domains)
+        routed.extend(self.default_domains)
+        return self._deduplicate_domains(routed)[:self.max_domain_queries]
+
+    def _query_variants(self, query: str) -> list[str]:
+        query = str(query or "").strip()
+        variants: list[str] = [query] if query else []
+        lower = query.lower()
+        if any(term in lower for term in ("sentinel-2", "sentinel 2", "msi")):
+            variants.extend([
+                "Sentinel-2 MSI spectral bands thermal infrared official documentation",
+                "Sentinel-2 MSI instrument bands specifications",
+            ])
+        if any(term in lower for term in ("landsat", "tirs", "surface temperature")):
+            variants.extend([
+                "Landsat Collection 2 surface temperature product official documentation",
+                "Landsat 8 9 TIRS thermal infrared surface temperature product",
+            ])
+        if any(term in lower for term in ("modis", "mod11")):
+            variants.extend([
+                "MODIS MOD11 land surface temperature product official documentation",
+            ])
+        if "ecostress" in lower:
+            variants.extend([
+                "ECOSTRESS land surface temperature product official documentation",
+            ])
+        if any(term in lower for term in ("google earth engine", "earth engine", "gee")):
+            variants.extend([
+                "Google Earth Engine Landsat surface temperature official documentation",
+            ])
+        if "python" in lower or "asyncio" in lower:
+            variants.extend([
+                "Python official documentation asyncio",
+            ])
+        if "github actions" in lower:
+            variants.extend([
+                "GitHub Actions official documentation",
+            ])
+        if "openai" in lower:
+            variants.extend([
+                "OpenAI API official documentation",
+            ])
+        if "powershell" in lower:
+            variants.extend([
+                "Microsoft PowerShell official documentation",
+            ])
+        return self._deduplicate_domains(variants)[:self.max_query_variants]
+
+    def _collect_official_results(
+        self,
+        merged: list[dict[str, Any]],
+        results: list[Any],
+        domains: list[str],
+        query: str,
+    ) -> None:
+        for item in results:
+            if not isinstance(item, dict):
                 continue
-            snippet = "; ".join(record.get("limitations", [])[:2]) or record.get("spatial_resolution", "")
-            for source in record.get("official_sources", []):
-                if not isinstance(source, dict):
-                    continue
-                results.append({
-                    "title": source.get("title", record.get("dataset", "")),
-                    "url": source.get("url", ""),
-                    "snippet": snippet,
-                    "official_domain": "curated-registry",
-                    "source_type": "official-curated",
-                })
-        return results
+            item = {**item, "_official_query": query}
+            matched_domain = self._matched_domain(item.get("url", ""), domains)
+            if not matched_domain:
+                continue
+            if not self._passes_official_relevance(item):
+                continue
+            normalized = dict(item)
+            normalized["official_domain"] = matched_domain
+            normalized["source_type"] = "official"
+            merged.append(normalized)
+
+    def _matched_domain(self, url: str, domains: list[str]) -> str:
+        for domain in domains:
+            if self._url_matches_domain(url, domain):
+                return domain
+        return ""
+
+    def _passes_official_relevance(self, item: dict[str, Any]) -> bool:
+        query_text = str(item.get("_official_query", "") or "")
+        haystack = " ".join([
+            str(item.get("title", "") or ""),
+            str(item.get("url", "") or ""),
+            str(item.get("snippet", "") or ""),
+        ]).lower()
+        required_groups = self._required_relevance_groups(query_text)
+        if not required_groups:
+            return True
+        return all(any(term in haystack for term in group) for group in required_groups)
+
+    def _required_relevance_groups(self, query: str) -> list[tuple[str, ...]]:
+        lower = query.lower()
+        groups: list[tuple[str, ...]] = []
+        if "sentinel-2" in lower or "sentinel 2" in lower or re.search(r"\bmsi\b", lower):
+            groups.append(("sentinel-2", "sentinel 2", "/s2", "s2-", "msi"))
+        if "landsat" in lower:
+            groups.append(("landsat", "tirs", "oli"))
+        if "modis" in lower or "mod11" in lower:
+            groups.append(("modis", "mod11"))
+        if "ecostress" in lower:
+            groups.append(("ecostress",))
+        if "earth engine" in lower or re.search(r"\bgee\b", lower):
+            groups.append(("earth engine", "google earth engine"))
+        if "python" in lower or "asyncio" in lower:
+            groups.append(("python", "asyncio"))
+        if "github" in lower:
+            groups.append(("github",))
+        if "openai" in lower:
+            groups.append(("openai",))
+        if "powershell" in lower:
+            groups.append(("powershell",))
+        return groups
+
+    def _deduplicate_domains(self, domains: list[str]) -> list[str]:
+        seen: set[str] = set()
+        unique: list[str] = []
+        for domain in domains:
+            normalized = str(domain).strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            unique.append(normalized)
+        return unique
 
     def _url_matches_domain(self, url: str, domain: str) -> bool:
         from urllib.parse import urlparse

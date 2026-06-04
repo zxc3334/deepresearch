@@ -17,6 +17,7 @@ from typing import Any
 from .base_agent import BaseAgent
 from ..orchestrator.schemas import SubTask, AgentResult, AgentStatus, ResearchReport
 from ..utils.tracing import trace_agent
+from ..utils.output_language import normalize_output_language, output_language_instruction
 
 
 __all__ = ["SummarizerAgent"]
@@ -42,11 +43,13 @@ class SummarizerAgent(BaseAgent):
         tools: list | None = None,
         pool_type_key: str | None = None,
         compact_config: dict | None = None,
+        output_language: str = "zh-CN",
         trace_recorder=None,
     ) -> None:
         super().__init__(name, policy, tools, pool_type_key=pool_type_key)
         compact_config = compact_config or {}
         self.trace_recorder = trace_recorder
+        self.output_language = normalize_output_language(output_language)
         self.context_budget_tokens = compact_config.get(
             "context_budget_tokens", self.default_context_budget_tokens
         )
@@ -169,6 +172,7 @@ class SummarizerAgent(BaseAgent):
         ))
 
     def _system_prompt(self, domain: str = "general") -> str:
+        language_instruction = output_language_instruction(self.output_language)
         if domain == "geo_remote_sensing":
             return (
                 "You are an expert GIS and remote-sensing research synthesizer. "
@@ -176,7 +180,8 @@ class SummarizerAgent(BaseAgent):
                 "Use Markdown formatting and cite sources explicitly when they are available. "
                 "Do not invent datasets, bands, algorithms, platform capabilities, spatial resolution, temporal resolution, or validation data. "
                 "When evidence is insufficient, label the item as Speculative or Needs Verification. "
-                "The report body MUST be at least 2500 Chinese characters (or 1600 English words) long. "
+                f"{language_instruction} "
+                "The report body MUST be at least 2500 Chinese characters when output language is zh-CN, or 1600 English words when output language is en-US. "
                 "DO NOT describe what you will do; directly output the synthesized report. "
                 "At the end, provide Overall Confidence: X.XX and a short source/evidence summary."
             )
@@ -185,7 +190,8 @@ class SummarizerAgent(BaseAgent):
             "You are an expert research synthesizer. "
             "Your task is to integrate multiple research findings into a coherent, well-structured report. "
             "Use Markdown formatting. Cite sources explicitly. "
-            "The report body MUST be at least 3000 Chinese characters (or 2000 English words) long. "
+            f"{language_instruction} "
+            "The report body MUST be at least 3000 Chinese characters when output language is zh-CN, or 2000 English words when output language is en-US. "
             "Write in depth: include background, key findings, detailed analysis, comparisons, and implications. "
             "DO NOT describe what you will do — directly output the synthesized report. "
             "At the end, provide an overall confidence score (0-1) and a summary of key sources."
@@ -365,14 +371,11 @@ class SummarizerAgent(BaseAgent):
 
     def _parse_report(self, query: str, content: str, results: list[AgentResult]) -> ResearchReport:
         """从 LLM 输出中解析 ResearchReport，并基于子任务成功率校准置信度。"""
-        # 1. 从文本中提取 LLM 自评置信度
-        llm_confidence = 0.5
-        m = re.search(r"[Oo]verall\s+[Cc]onfidence[:\s]+(0\.\d+|1\.0|1)", content)
-        if m:
-            try:
-                llm_confidence = float(m.group(1))
-            except ValueError:
-                pass
+        # 1. 从文本中提取 LLM 自评置信度；解析失败时用证据分级做保守回退。
+        evidence_summary = self._summarize_result_evidence(results)
+        llm_confidence = self._extract_report_confidence(content)
+        if llm_confidence is None:
+            llm_confidence = self._fallback_confidence_from_evidence(evidence_summary)
 
         # 2. 基于子任务成功率计算客观置信度
         total = len(results)
@@ -426,7 +429,6 @@ class SummarizerAgent(BaseAgent):
             for r in results
         )
 
-        evidence_summary = self._summarize_result_evidence(results)
         return ResearchReport(
             query=query,
             content=content,
@@ -436,6 +438,52 @@ class SummarizerAgent(BaseAgent):
             evidence_summary=evidence_summary,
             tool_trace=self._build_tool_trace(results),
         )
+
+    def _extract_report_confidence(self, content: str) -> float | None:
+        """Extract final confidence from common English/Chinese report formats."""
+        number = r"([01](?:\.\d+)?|100(?:\.0+)?%|[1-9]\d(?:\.\d+)?%)"
+        patterns = [
+            rf"[Oo]verall\s+[Cc]onfidence\s*(?:score)?\s*[:：]\s*{number}",
+            rf"(?:overall\s+)?confidence\s*(?:score)?\s*[:：]\s*{number}",
+            rf"(?:整体|总体|综合)?置信度\s*[:：]\s*{number}",
+            rf"(?:整体|总体|综合)?可信度\s*[:：]\s*{number}",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, content, flags=re.IGNORECASE)
+            if not match:
+                continue
+            value = self._parse_confidence_value(match.group(1))
+            if value is not None:
+                return value
+        return None
+
+    def _parse_confidence_value(self, raw: str) -> float | None:
+        text = str(raw or "").strip()
+        try:
+            if text.endswith("%"):
+                return max(0.0, min(1.0, float(text[:-1]) / 100.0))
+            return max(0.0, min(1.0, float(text)))
+        except ValueError:
+            return None
+
+    def _fallback_confidence_from_evidence(self, evidence_summary: dict[str, Any]) -> float:
+        """Conservative fallback when the report omits a parseable confidence line."""
+        counts = evidence_summary.get("counts", {}) if evidence_summary else {}
+        total = sum(int(v or 0) for v in counts.values())
+        if total <= 0:
+            return 0.5
+
+        verified = int(counts.get("verified", 0) or 0)
+        backed = int(counts.get("evidence_backed", 0) or 0)
+        speculative = int(counts.get("speculative", 0) or 0)
+        rejected = int(counts.get("rejected", 0) or 0)
+        score = (
+            0.45
+            + 0.35 * ((verified + backed) / total)
+            - 0.15 * (speculative / total)
+            - 0.25 * (rejected / total)
+        )
+        return round(max(0.2, min(0.85, score)), 2)
 
     def _summarize_result_evidence(self, results: list[AgentResult]) -> dict[str, Any]:
         counts: dict[str, int] = {}
@@ -454,11 +502,7 @@ class SummarizerAgent(BaseAgent):
                 if step.get("role") != "tool":
                     continue
                 payload = step.get("result")
-                urls = []
-                if isinstance(payload, dict):
-                    for item in payload.get("results", []) or []:
-                        if isinstance(item, dict) and item.get("url"):
-                            urls.append(item["url"])
+                urls = self._extract_tool_urls(payload)
                 trace.append({
                     "task_id": result.task_id,
                     "tool": step.get("name", ""),
@@ -467,3 +511,18 @@ class SummarizerAgent(BaseAgent):
                     "urls": urls[:5],
                 })
         return trace
+
+    def _extract_tool_urls(self, payload: Any) -> list[str]:
+        if not isinstance(payload, dict):
+            return []
+        urls: list[str] = []
+        for item in payload.get("results", []) or []:
+            if isinstance(item, dict) and item.get("url"):
+                urls.append(str(item["url"]))
+        for paper in payload.get("papers", []) or []:
+            if not isinstance(paper, dict):
+                continue
+            url = paper.get("url") or paper.get("pdf_url")
+            if url:
+                urls.append(str(url))
+        return urls
