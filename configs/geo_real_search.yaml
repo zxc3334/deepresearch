@@ -1,4 +1,4 @@
-# GeoResearch Agent config with real web search enabled.
+﻿# GeoResearch Agent config with real web search enabled.
 # Keep configs/geo_mvp.yaml as the stable mock demo; use this file when you
 # want evidence from live search APIs.
 
@@ -8,7 +8,11 @@ system:
   log_level: "INFO"
   work_dir: "./outputs"
 
+output:
+  language: "zh-CN"
+
 model:
+  active_preset: "balanced"
   default_profile: "solver"
   providers:
     deepseek:
@@ -37,11 +41,44 @@ model:
       temperature: 0.1
       top_p: 1.0
       max_tokens: 1024
+    wiki_ingest:
+      provider: "deepseek"
+      temperature: 0.1
+      top_p: 1.0
+      max_tokens: 6144
+      response_format:
+        type: "json_object"
   module_profiles:
     planner: "planner"
     solver: "solver"
     summarizer: "summarizer"
     compressor: "compressor"
+    wiki_ingest: "wiki_ingest"
+  presets:
+    balanced:
+      default_profile: "solver"
+      module_profiles:
+        planner: "planner"
+        solver: "solver"
+        summarizer: "summarizer"
+        compressor: "compressor"
+        wiki_ingest: "wiki_ingest"
+    low_cost:
+      default_profile: "solver"
+      module_profiles:
+        planner: "planner"
+        solver: "solver"
+        summarizer: "compressor"
+        compressor: "compressor"
+        wiki_ingest: "compressor"
+    high_quality:
+      default_profile: "solver"
+      module_profiles:
+        planner: "planner"
+        solver: "solver"
+        summarizer: "summarizer"
+        compressor: "compressor"
+        wiki_ingest: "wiki_ingest"
 
 orchestrator:
   max_concurrent: 2
@@ -100,6 +137,25 @@ memory:
   evict_interval: 100
   enable_vector_index: true
 
+wiki:
+  enabled: true
+  root_dir: "data/wiki"
+  max_context_chars: 2000
+  ingest:
+    min_confidence: 0.5
+    raw_dedup:
+      enabled: true
+      threshold: 0.72
+      reingest_duplicate: false
+    structured:
+      enabled: true
+      mode: "background"
+      extractor: "llm"
+      max_entities: 8
+      max_source_chars: 18000
+      join_on_exit: true
+      join_timeout_seconds: 90
+
 adversarial:
   enabled: false
   max_rounds: 1
@@ -110,12 +166,20 @@ adversarial:
 evolution:
   enabled: false
 
+domain_adapter:
+  mode: "geo_remote_sensing"
+  user_adapters_dir: "data/user_adapters"
+
 tools:
   web_search:
     enabled: true
     mock_mode: false
     max_results: 5
     snippet_max_tokens: 256
+  official_source_search:
+    max_domain_queries: 4
+    max_query_variants: 2
+    max_attempts: 6
   official_doc_fetcher:
     enabled: true
     timeout_seconds: 20
@@ -123,12 +187,14 @@ tools:
     enabled: true
     backend: "openalex"
   arxiv_reader:
-    enabled: true
+    enabled: false
     max_papers: 3
     abstract_max_tokens: 512
   code_sandbox:
-    enabled: false
+    enabled: true
     timeout_seconds: 10
     max_memory_mb: 512
-  geo_registry:
-    enabled: true
+  file_reader:
+    enabled: false
+  notepad:
+    enabled: false

@@ -1,4 +1,4 @@
-# GeoResearch Agent MVP config.
+﻿# GeoResearch Agent MVP config.
 # This config keeps the stable baseline runtime settings while enabling the
 # GIS / remote-sensing planner domain.
 
@@ -8,7 +8,11 @@ system:
   log_level: "INFO"
   work_dir: "./outputs"
 
+output:
+  language: "zh-CN"
+
 model:
+  active_preset: "balanced"
   default_profile: "solver"
   providers:
     deepseek:
@@ -42,6 +46,28 @@ model:
     solver: "solver"
     summarizer: "summarizer"
     compressor: "compressor"
+  presets:
+    balanced:
+      default_profile: "solver"
+      module_profiles:
+        planner: "planner"
+        solver: "solver"
+        summarizer: "summarizer"
+        compressor: "compressor"
+    low_cost:
+      default_profile: "solver"
+      module_profiles:
+        planner: "planner"
+        solver: "solver"
+        summarizer: "compressor"
+        compressor: "compressor"
+    high_quality:
+      default_profile: "solver"
+      module_profiles:
+        planner: "planner"
+        solver: "solver"
+        summarizer: "summarizer"
+        compressor: "compressor"
 
 orchestrator:
   max_concurrent: 2
@@ -100,6 +126,13 @@ memory:
   evict_interval: 100
   enable_vector_index: true
 
+wiki:
+  enabled: true
+  root_dir: "data/wiki"
+  max_context_chars: 2000
+  ingest:
+    min_confidence: 0.5
+
 adversarial:
   enabled: false
   max_rounds: 1
@@ -110,6 +143,10 @@ adversarial:
 evolution:
   enabled: false
 
+domain_adapter:
+  mode: "geo_remote_sensing"
+  user_adapters_dir: "data/user_adapters"
+
 tools:
   web_search:
     enabled: true
@@ -117,12 +154,14 @@ tools:
     max_results: 5
     snippet_max_tokens: 256
   arxiv_reader:
-    enabled: true
+    enabled: false
     max_papers: 3
     abstract_max_tokens: 512
   code_sandbox:
-    enabled: false
+    enabled: true
     timeout_seconds: 10
     max_memory_mb: 512
-  geo_registry:
-    enabled: true
+  file_reader:
+    enabled: false
+  notepad:
+    enabled: false

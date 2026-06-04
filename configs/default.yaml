@@ -1,4 +1,4 @@
-# =============================================================================
+﻿# =============================================================================
 # DeepResearchAgent 全局默认配置文件
 # =============================================================================
 # 本文件定义了系统的全局参数、模型接口、各模块开关及超参数。
@@ -14,7 +14,11 @@ system:
   # 工作目录，用于存放临时文件与输出报告
   work_dir: "./outputs"
 
+output:
+  language: "zh-CN"
+
 model:
+  active_preset: "balanced"
   # ---------------------------------------------------------------------------
   # 多后端 LLM 配置
   # ---------------------------------------------------------------------------
@@ -106,6 +110,38 @@ model:
     blue_agent: "mimo"        # 对抗修复：Xiaomi MiMo 2.5 Pro
     compressor: "mimo"        # 上下文压缩：MiMo（摘要任务成本低）
 
+  presets:
+    balanced:
+      default_profile: "solver"
+      module_profiles:
+        planner: "planner"
+        solver: "solver"
+        summarizer: "summarizer"
+        compressor: "compressor"
+        judge: "judge"
+        red_agent: "red_agent"
+        blue_agent: "blue_agent"
+    low_cost:
+      default_profile: "solver"
+      module_profiles:
+        planner: "planner"
+        solver: "solver"
+        summarizer: "compressor"
+        compressor: "compressor"
+        judge: "judge"
+        red_agent: "red_agent"
+        blue_agent: "blue_agent"
+    high_quality:
+      default_profile: "solver"
+      module_profiles:
+        planner: "planner"
+        solver: "solver"
+        summarizer: "summarizer"
+        compressor: "compressor"
+        judge: "judge"
+        red_agent: "red_agent"
+        blue_agent: "blue_agent"
+
 orchestrator:
   # M1: Multi-Agent Orchestrator 配置
   # 同时运行的最大子 Agent 数量
@@ -162,6 +198,13 @@ memory:
   # 是否启用向量化索引（加速相似度检索）
   enable_vector_index: true
 
+wiki:
+  enabled: true
+  root_dir: "data/wiki"
+  max_context_chars: 2000
+  ingest:
+    min_confidence: 0.5
+
 adversarial:
   # M5: Red-Blue Adversarial Loop 配置
   # 总开关：是否启用对抗降噪流程
@@ -201,6 +244,10 @@ evolution:
   # 每隔多少轮执行一次符号规则学习
   symbolic_learning_interval: 3
 
+domain_adapter:
+  mode: "general"
+  user_adapters_dir: "data/user_adapters"
+
 tools:
   # 工具模块全局配置
   web_search:
@@ -212,7 +259,7 @@ tools:
     # 搜索结果摘要最大 token 数
     snippet_max_tokens: 512
   arxiv_reader:
-    enabled: true
+    enabled: false
     # 单次 ArXiv 查询最多获取的论文数
     max_papers: 5
     # 论文摘要最大 token 数
@@ -223,3 +270,7 @@ tools:
     timeout_seconds: 30
     # 允许的最大内存（MB）
     memory_limit_mb: 512
+  file_reader:
+    enabled: false
+  notepad:
+    enabled: false

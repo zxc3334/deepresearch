@@ -1,11 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Run one end-to-end GeoResearch integration demo.
-
-This script is intended for manual architecture validation, not benchmarking.
-It writes a report, JSONL trace, trace HTML dashboard, progress events, and a
-small memory-scope summary into one output directory.
-"""
+"""Run one end-to-end DeepResearch integration demo."""
 
 from __future__ import annotations
 
@@ -37,6 +32,7 @@ PRESET_DEFAULTS = {
     "general": {
         "query": DEFAULT_GENERAL_QUERY,
         "config": "configs/default.yaml",
+        "adapter": "general",
         "output_prefix": "general_demo",
         "user_id": "demo-general",
         "session_prefix": "general-demo",
@@ -45,6 +41,7 @@ PRESET_DEFAULTS = {
     "geo": {
         "query": DEFAULT_GEO_QUERY,
         "config": "configs/geo_real_search.yaml",
+        "adapter": "geo_remote_sensing",
         "output_prefix": "geo_demo",
         "user_id": "demo-geo",
         "session_prefix": "geo-demo",
@@ -149,12 +146,22 @@ def inspect_trace(trace_path: Path) -> dict[str, Any]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run a GeoResearch end-to-end integration demo.",
+        description="Run a DeepResearch end-to-end integration demo.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--preset", default="geo", choices=["general", "geo"], help="Demo preset.")
     parser.add_argument("--query", default="", help="Research question. Defaults to the selected preset query.")
     parser.add_argument("--config", default="", help="YAML config path. Defaults to the selected preset config.")
+    parser.add_argument(
+        "--adapter",
+        default="",
+        help="Domain adapter: auto, general, geo_remote_sensing, or a user adapter id.",
+    )
+    parser.add_argument(
+        "--user-adapters-dir",
+        default="",
+        help="Directory containing user adapter YAML files.",
+    )
     parser.add_argument("--output-dir", default="", help="Output directory. Defaults to outputs/<preset>_<timestamp>.")
     parser.add_argument("--user-id", default="", help="Memory user scope. Defaults to the selected preset user.")
     parser.add_argument("--session-id", default="", help="Memory session scope. Defaults to <preset>-demo-<timestamp>.")
@@ -163,12 +170,33 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def apply_adapter_override(
+    config: dict[str, Any],
+    *,
+    adapter: str = "",
+    user_adapters_dir: str = "",
+    query: str = "",
+) -> dict[str, Any]:
+    adapter_cfg = dict(config.get("domain_adapter", {}) or {})
+    if adapter:
+        adapter_cfg["mode"] = adapter
+    adapter_cfg.setdefault("mode", "general")
+    if user_adapters_dir:
+        adapter_cfg["user_adapters_dir"] = user_adapters_dir
+    adapter_cfg.setdefault("user_adapters_dir", "data/user_adapters")
+    config["domain_adapter"] = adapter_cfg
+    if query:
+        config["query"] = query
+    return config
+
+
 def main() -> None:
     args = parse_args()
     stamp = _timestamp()
     preset = PRESET_DEFAULTS[args.preset]
     query = args.query or preset["query"]
     config_path = args.config or preset["config"]
+    adapter = args.adapter or preset["adapter"]
     user_id = args.user_id or preset["user_id"]
     output_dir = Path(args.output_dir or f"outputs/{preset['output_prefix']}_{stamp}")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -184,6 +212,12 @@ def main() -> None:
 
     logger.info("Loading config: %s", config_path)
     config = load_config(config_path)
+    config = apply_adapter_override(
+        config,
+        adapter=adapter,
+        user_adapters_dir=args.user_adapters_dir,
+        query=query,
+    )
     config["_trace_path"] = str(trace_path)
     config["_progress_callback"] = build_progress_callback(progress_path)
     config["_user_id"] = user_id
@@ -206,6 +240,7 @@ def main() -> None:
     trace_summary = inspect_trace(trace_path)
     summary = {
         "preset": args.preset,
+        "adapter": config.get("domain_adapter", {}).get("mode", ""),
         "query": query,
         "config": config_path,
         "output_dir": str(output_dir),
@@ -222,7 +257,8 @@ def main() -> None:
     }
     _write_json(summary_path, summary)
 
-    print("\n=== GeoResearch Integration Demo ===")
+    print("\n=== DeepResearch Integration Demo ===")
+    print(f"Adapter:        {summary['adapter']}")
     print(f"Report:         {report_path}")
     print(f"Trace JSONL:    {trace_path}")
     print(f"Trace HTML:     {trace_report_path or 'not generated'}")

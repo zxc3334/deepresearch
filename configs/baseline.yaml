@@ -1,4 +1,4 @@
-# Baseline smoke-test config for GeoResearch Agent migration.
+﻿# Baseline smoke-test config for GeoResearch Agent migration.
 # Goal: run the original DeepResearch workflow with the fewest external
 # dependencies before GIS/remote-sensing customization begins.
 
@@ -8,7 +8,11 @@ system:
   log_level: "INFO"
   work_dir: "./outputs"
 
+output:
+  language: "zh-CN"
+
 model:
+  active_preset: "balanced"
   backend: "deepseek"
   temperature: 0.5
   top_p: 1.0
@@ -41,6 +45,29 @@ model:
     summarizer: "deepseek"
     compressor: "deepseek"
 
+  presets:
+    balanced:
+      default_profile: "solver"
+      module_profiles:
+        planner: "planner"
+        solver: "solver"
+        summarizer: "summarizer"
+        compressor: "compressor"
+    low_cost:
+      default_profile: "solver"
+      module_profiles:
+        planner: "planner"
+        solver: "solver"
+        summarizer: "solver"
+        compressor: "compressor"
+    high_quality:
+      default_profile: "solver"
+      module_profiles:
+        planner: "planner"
+        solver: "solver"
+        summarizer: "summarizer"
+        compressor: "compressor"
+
 orchestrator:
   max_concurrent: 2
   global_timeout_seconds: 360
@@ -71,6 +98,13 @@ memory:
   evict_interval: 100
   enable_vector_index: true
 
+wiki:
+  enabled: true
+  root_dir: "data/wiki"
+  max_context_chars: 2000
+  ingest:
+    min_confidence: 0.5
+
 adversarial:
   enabled: false
   max_rounds: 1
@@ -81,6 +115,10 @@ adversarial:
 evolution:
   enabled: false
 
+domain_adapter:
+  mode: "general"
+  user_adapters_dir: "data/user_adapters"
+
 tools:
   web_search:
     enabled: true
@@ -88,10 +126,14 @@ tools:
     max_results: 5
     snippet_max_tokens: 256
   arxiv_reader:
-    enabled: true
+    enabled: false
     max_papers: 3
     abstract_max_tokens: 512
   code_sandbox:
     enabled: false
     timeout_seconds: 10
     max_memory_mb: 512
+  file_reader:
+    enabled: false
+  notepad:
+    enabled: false
