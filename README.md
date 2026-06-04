@@ -1,100 +1,241 @@
 # GeoResearch Agent
 
-面向 GIS / 遥感研究问题的 evidence-aware DeepResearch Agent。
+面向面试展示的 DeepResearch Agent 项目：以通用深度研究为核心，通过 domain profile 动态增强 GIS/遥感研究能力。系统不是简单问答机器人，而是把复杂问题拆成 DAG 子任务，并通过工具调用、外部证据检索、长期记忆、trace 可观测性和证据分级，生成可追踪的研究报告。
 
-本项目基于一个通用 DeepResearch Agent 代码框架改造，目标不是做简单问答机器人，而是构建一个能围绕 GIS / 遥感研究问题自动拆解任务、检索证据、推荐数据源与方法、检查空间分析风险，并生成结构化研究方案报告的多 Agent 系统。
-
-当前项目处于 MVP 改造阶段：原始 DeepResearch 主流程已跑通，真实 semantic memory / RAG 依赖已可用，正在进行 GIS / 遥感领域化设计与实现。
+![Trace report preview](docs/assets/trace-report-preview.svg)
 
 ## 项目定位
 
-传统 LLM 可以回答“城市热岛怎么分析”，但容易出现三个问题：
+这个项目的核心目标是解决普通 LLM 研究报告常见的三个问题：
 
-- 数据源和方法可能来自模型记忆，缺少外部证据。
-- 遥感方法与数据不一定匹配，例如错误地用 Sentinel-2 直接反演 LST。
-- 报告看起来完整，但缺少 AOI、时间范围、传感器、分辨率、CRS、云量、验证方案等关键空间分析约束。
+1. **缺少外部证据**：模型容易凭记忆生成看似合理但不可追踪的结论。
+2. **上下文不可控**：多轮搜索后工具结果会堆积，导致注意力稀释和错误复用。
+3. **领域约束不足**：GIS/遥感任务需要检查 AOI、时间范围、传感器、波段、分辨率、CRS、云量和验证方案。
 
-GeoResearch Agent 的目标是把 LLM 放在“候选生成和解释”的位置，把真实性交给工具、RAG、数据目录和验证规则：
+GeoResearch Agent 的设计思路是：
 
-```text
-LLM 生成候选方案
-  -> 工具 / RAG / registry 查证
-  -> Validator 检查数据与方法适配性
-  -> 按 Verified / Evidence-backed / Speculative 分级
-  -> 生成可追溯研究报告
+```mermaid
+flowchart LR
+    Q["User Query"] --> P["Planner"]
+    P --> D["DAG SubTasks"]
+    D --> O["Orchestrator"]
+    O --> A["Agent Pool"]
+    A --> L["Tool Calling Loop"]
+    L --> T["Search / Paper / Official / Browser / Wiki Tools"]
+    T --> E["Evidence Store"]
+    E --> S["Summarizer"]
+    S --> R["Evidence-aware Report"]
+    R --> W["Wiki Ingest"]
+    W --> M["Long-term Memory"]
 ```
 
-## 当前能力
+## 主要功能
 
-- 基于 Planner 将复杂研究问题拆解为 DAG 子任务。
-- 基于 Orchestrator 状态机调度子任务执行。
-- 基于 asyncio + DAG layer scheduling 支持并发执行。
-- 基于 Agent tool-calling loop 调用搜索、论文、网页、文件、计算等工具。
-- 基于 Memory Store 保存中间结果，并使用 sentence-transformers 进行语义检索、去重和冲突检测。
-- 已完成 baseline 运行，能生成一份 Landsat 城市热岛分析流程报告。
+| 功能 | 说明 |
+|---|---|
+| Planner DAG | 将复杂研究问题拆解为有依赖关系的子任务，Orchestrator 按 DAG 调度执行 |
+| AgentPool + Agent 执行器 | 池化的是绑定好 policy、prompt builder、tool registry、loop config、context compressor、memory adapter 的执行器 |
+| Tool-calling loop | LLM 负责选择工具和参数，loop 负责执行工具、保存上下文、处理终止条件和错误状态 |
+| 多模型配置 | 通过 `providers -> profiles -> module_profiles` 三层配置，把 API 服务商、模型参数和模块路由分开 |
+| 外部证据工具 | 支持 web search、paper search、official source search、official doc fetcher、browser、calculator、code sandbox、wiki search |
+| 证据分级 | 对结论标记 `verified`、`evidence_backed`、`speculative`、`rejected`，避免报告把推断伪装成事实 |
+| Context compact | 对工具返回和最终合成输入做预算控制，保留错误信息并标记 `[compact]` |
+| 长期记忆 / Wiki | 把高质量报告通过 LLM 结构化提取后写入 wiki store，后续查询可通过 `wiki_search` 复用 |
+| JSONL Trace + HTML 报告 | 每次运行记录状态迁移、LLM 调用、工具调用、usage、证据项、wiki ingest 等事件 |
+| 通用 + GIS/RS Profile | 通用模式默认启用通用工具；GIS/遥感模式通过 prompt sections、preferred domains 和专用检查清单增强 |
 
-## 改造目标
-
-MVP 聚焦“遥感研究方案设计”，暂不做完整遥感影像下载和自动计算。
-
-计划支持：
-
-- GIS / 遥感问题拆解
-- AOI、时间范围、传感器、数据源识别
-- 遥感数据源候选推荐
-- 遥感方法候选推荐
-- 数据与方法适配性验证
-- 最终报告按可信度分级输出
-
-暂不包含：
-
-- GEE / openEO 自动执行
-- 本地大模型推理或训练
-- 大规模遥感影像下载
-- QGIS 插件
-- PostGIS 空间数据库
-- 完整生产级 STAC 接入
-
-## 架构概览
+## 架构图
 
 ```mermaid
 flowchart TD
-    A["User GIS/RS Question"] --> B["Geo Planner"]
-    B --> C["DAG SubTasks"]
-    C --> D["Orchestrator"]
-    D --> E["Literature Task"]
-    D --> F["Data Discovery Task"]
-    D --> G["Method Design Task"]
-    D --> H["Geo Validation Task"]
-    E --> I["Evidence / Memory"]
-    F --> I
-    G --> I
-    H --> I
-    I --> J["Geo Summarizer"]
-    J --> K["Evidence-aware Report"]
+    subgraph Config["Configuration"]
+        C1["model.providers"]
+        C2["model.profiles"]
+        C3["model.module_profiles"]
+        C4["domain profile"]
+        C5["output.language"]
+    end
+
+    subgraph Core["Core DeepResearch"]
+        R["Runner"]
+        P["Planner"]
+        O["Orchestrator State Machine"]
+        AP["AgentPool"]
+        AG["Agent Executor"]
+        TL["ToolCallingLoop"]
+        ES["Evidence Store"]
+        TR["Trace Recorder"]
+        MEM["Memory / Wiki Store"]
+    end
+
+    subgraph Tools["Tools"]
+        WS["web_search"]
+        PS["paper_search"]
+        OS["official_source_search"]
+        OD["official_doc_fetcher"]
+        BR["browser"]
+        WK["wiki_search"]
+        CS["code_sandbox"]
+    end
+
+    C1 --> R
+    C2 --> R
+    C3 --> R
+    C4 --> AP
+    C5 --> AG
+    R --> P
+    P --> O
+    O --> AP
+    AP --> AG
+    AG --> TL
+    TL --> Tools
+    Tools --> ES
+    ES --> TR
+    ES --> MEM
+    O --> TR
 ```
 
-核心模块：
+## Agent 执行流程
 
-| 模块 | 作用 |
-|---|---|
-| `src/planner` | 将用户问题拆解为 DAG 子任务 |
-| `src/orchestrator` | 状态机、并发调度、失败收集、重规划 |
-| `src/agents` | Researcher / Summarizer 等 Agent 实现 |
-| `src/tools` | 搜索、论文、浏览器、计算、后续 GIS 工具 |
-| `src/memory` | 语义记忆、去重、冲突检测 |
-| `src/models` | OpenAI-compatible LLM provider 封装 |
+```mermaid
+sequenceDiagram
+    participant User
+    participant Planner
+    participant Orchestrator
+    participant Agent
+    participant Loop as ToolCallingLoop
+    participant Tools
+    participant Evidence
+    participant Summary
+    participant Wiki
 
-## 当前里程碑
+    User->>Planner: 输入研究问题
+    Planner->>Orchestrator: 返回 DAG 子任务
+    Orchestrator->>Agent: 分配可执行 task
+    Agent->>Loop: 构造 system prompt、工具集合、上下文预算
+    Loop->>Tools: LLM 选择工具并传入 JSON 参数
+    Tools->>Loop: 返回搜索/论文/官方文档/网页结果
+    Loop->>Evidence: 写入证据项和置信度线索
+    Agent->>Orchestrator: 返回 task result
+    Orchestrator->>Summary: 汇总 DAG 结果
+    Summary->>User: 生成 evidence-aware report
+    Summary->>Wiki: 高质量报告进入 LLM 结构化 ingest
+```
 
-- M0：项目副本与环境搭建完成
-- M1：原项目主流程 baseline 跑通
-- M2：GIS / 遥感领域化 MVP 设计中
-- M3：Evidence-aware 数据结构设计待实现
-- M4：GIS / 遥感工具待实现
-- M5：Demo 与简历展示待整理
+## Demo 展示
 
-详细进度见：[项目日志.md](项目日志.md)。
+![Report preview](docs/assets/report-preview.svg)
+
+一次 GIS/遥感 demo 的 trace 摘要示例：
+
+| 指标 | 示例值 |
+|---|---:|
+| Trace events | 95 |
+| Tool calls | 12 |
+| `evidence_backed` | 12 |
+| `speculative` | 4 |
+| `rejected` | 1 |
+| Wiki structured ingest | completed |
+
+报告片段见：[docs/demo/sample_report_excerpt.md](docs/demo/sample_report_excerpt.md)
+
+真实运行产物会写入 `outputs/<run-id>/`，包含：
+
+```text
+report_*.md                 # 最终研究报告
+trace.jsonl                 # 原始 trace 事件
+trace_report.html           # 可视化 trace 报告
+progress_events.jsonl       # 面向前端 SSE 的进度事件
+integration_summary.json    # 本次运行摘要
+```
+
+`outputs/` 默认不提交。展示给面试官时建议只提交精选截图、SVG 图或经过脱敏的 demo 片段。
+
+## 通用模式与 GIS/RS 模式
+
+### 通用 DeepResearch
+
+通用模式适合技术调研、产品调研、论文背景调研、API 文档调研等任务。它不会强制加入 GIS/遥感规则。
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 scripts\run_geo_integration_demo.py `
+  --query "Python asyncio 中 task cancellation 的官方语义是什么？请结合官方文档和实践风险说明。" `
+  --config configs\default.yaml `
+  --output-dir outputs\general_demo_01 `
+  --user-id demo-general `
+  --session-id general-demo-01 `
+  --run-id general-demo-01 `
+  --log-level INFO
+```
+
+### GIS/遥感增强模式
+
+GIS/遥感模式会动态加入领域 prompt sections、preferred domains 和遥感风险检查清单，适合城市热岛、土地利用变化、遥感数据选择、方法验证等问题。
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 scripts\run_geo_integration_demo.py `
+  --query "如何研究 2018-2024 年武汉城市扩张对地表热环境的影响？请给出数据选择、方法流程、验证方案和潜在风险。" `
+  --config configs\geo_real_search.yaml `
+  --output-dir outputs\geo_demo_01 `
+  --user-id demo-geo `
+  --session-id geo-demo-01 `
+  --run-id geo-demo-01 `
+  --log-level INFO
+```
+
+## 配置说明
+
+### 输出语言
+
+```yaml
+output:
+  language: "zh-CN"
+```
+
+当前支持 `zh-CN` 和 `en-US`。配置会传入 researcher prompt、summarizer prompt 和 wiki ingest prompt。
+
+### 三层模型配置
+
+```yaml
+model:
+  default_profile: "solver"
+
+  providers:
+    deepseek:
+      adapter: "openai_compatible"
+      env_prefix: "DEEPSEEK"
+      default_model: "deepseek-chat"
+      default_base_url: "https://api.deepseek.com/v1"
+
+  profiles:
+    planner:
+      provider: "deepseek"
+      model: "deepseek-chat"
+      temperature: 0.2
+      max_tokens: 4096
+    solver:
+      provider: "deepseek"
+      model: "deepseek-chat"
+      temperature: 0.5
+      max_tokens: 4096
+    summarizer:
+      provider: "deepseek"
+      model: "deepseek-chat"
+      temperature: 0.2
+      max_tokens: 8192
+
+  module_profiles:
+    planner: "planner"
+    researcher: "solver"
+    summarizer: "summarizer"
+```
+
+这套配置的优点是：
+
+- `providers` 只描述 API 服务商和环境变量来源。
+- `profiles` 描述模型名和采样参数。
+- `module_profiles` 决定 planner、researcher、summarizer 等模块使用哪个 profile。
+- 未来前端只需要让用户在你提供的模型候选中选择，不需要让用户填写 API key。
 
 ## 环境准备
 
@@ -109,206 +250,72 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 
 python -m pip install -r requirements-minimal.txt -i https://pypi.org/simple
 python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
-python -m pip install -U sentence-transformers scikit-learn transformers -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn --timeout 120
+python -m pip install -U sentence-transformers scikit-learn transformers `
+  -i https://pypi.tuna.tsinghua.edu.cn/simple `
+  --trusted-host pypi.tuna.tsinghua.edu.cn `
+  --timeout 120
 python -m pip install -e . --no-deps
 ```
 
-可选数据分析依赖：
+如果只想快速跑单元测试，优先安装 `requirements-minimal.txt`。本地大模型训练和推理不是本项目 MVP 的重点。
 
-```powershell
-python -m pip install -U pandas matplotlib -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn --timeout 120
-```
-
-## 配置密钥
+## API Key
 
 复制模板：
 
 ```powershell
 Copy-Item .env.template .env
+Copy-Item .env.tools.template .env.local
 ```
 
-填写至少一个 OpenAI-compatible 后端，例如 DeepSeek：
+至少需要配置一个 OpenAI-compatible LLM provider，例如：
 
 ```text
-DEFAULT_LLM_BACKEND=deepseek
 DEEPSEEK_API_KEY=your_api_key
-DEEPSEEK_BASE_URL=https://api.deepseek.com
-DEEPSEEK_MODEL=deepseek-v4-flash
+DEEPSEEK_BASE_URL=https://api.deepseek.com/v1
+DEEPSEEK_MODEL=deepseek-chat
 ```
 
-注意：`.env` 已被 `.gitignore` 忽略，不要提交密钥。
+搜索工具根据你启用的 provider 填写对应 key，例如 Bocha、SerpAPI、Bing Search 或 Metaso。`.env` 和 `.env.local` 已被 `.gitignore` 排除，不能提交到 GitHub。
 
-## Provider / Model 配置
-
-M6 之后，推荐把“API 服务商”和“模块使用的模型配置”分开写：
-
-```text
-model.providers
-  deepseek / openai / vllm / mimo
-  - adapter
-  - env_prefix
-  - base_url
-  - api_key from env
-  - default_model
-        |
-        v
-model.profiles
-  planner / solver / summarizer / compressor
-  - provider
-  - model
-  - temperature
-  - top_p
-  - max_tokens
-        |
-        v
-model.module_profiles
-  planner -> planner
-  solver -> solver
-  summarizer -> summarizer
-        |
-        v
-LLMModelFactory
-        |
-        v
-OpenAICompatiblePolicy
-```
-
-```yaml
-model:
-  default_profile: "solver"
-  providers:
-    deepseek:
-      adapter: "openai_compatible"
-      env_prefix: "DEEPSEEK"
-      default_model: "deepseek-chat"
-      default_base_url: "https://api.deepseek.com/v1"
-  profiles:
-    planner:
-      provider: "deepseek"
-      temperature: 0.2
-      max_tokens: 4096
-    solver:
-      provider: "deepseek"
-      temperature: 0.5
-      max_tokens: 2048
-  module_profiles:
-    planner: "planner"
-    solver: "solver"
-```
-
-- `providers`：封装 API 服务商、OpenAI-compatible adapter、env 前缀、默认模型和 base URL。
-- `profiles`：封装模型名、temperature、top_p、max_tokens 等调用参数。
-- `module_profiles`：决定 `planner / solver / summarizer / compressor` 分别使用哪个 profile。
-- `OpenAICompatiblePolicy`：只负责一次 OpenAI-compatible LLM 调用；旧名 `VLLMPolicy` 仍作为兼容别名保留。
-- 旧的 `backend / backend_sampling / backend_mapping` 仍兼容，但新配置优先使用上述命名。
-
-## M7 外部证据工具
-
-真实搜索配置 `configs/geo_real_search.yaml` 会启用：
-
-- `official_source_search`：优先检索 ESA、USGS、NASA、Copernicus、GEE、Microsoft Planetary Computer 等官方来源。
-- `official_doc_fetcher`：读取官方 URL 正文，抽取和 query 匹配的证据片段。该工具不需要 API key，但只允许访问官方域名 allowlist，避免把普通网页误当作强证据。
-- `paper_search`：通过 OpenAlex / Semantic Scholar / ArXiv 检索学术论文。默认 OpenAlex，不需要 API key，用于方法依据、公式来源、适用性限制和引用证据。
-
-当前需要填写的外部搜索 key 仍然是 `.env.local` 中的搜索服务 key，例如 `BOCHA_API_KEY`、`SERPAPI_KEY`、`BING_SEARCH_KEY` 或 `METASO_API_KEY`。`official_doc_fetcher` 本身不新增密钥要求。
-
-## Baseline 运行
-
-当前 baseline 使用 mock search，目的是验证主流程，而不是生成真实证据报告。
+## 测试
 
 ```powershell
-$env:LANGSMITH_TRACING="false"
-
-python -X utf8 scripts\run_single.py `
-  --query "简要分析遥感研究中使用 Landsat 进行城市热岛分析的一般流程" `
-  --config configs\baseline.yaml `
-  --output_dir outputs\baseline `
-  --session_id baseline_001 `
-  --log_level INFO
+.\.venv\Scripts\python.exe -X utf8 -m unittest discover -s tests/unit -p "test_*.py"
+.\.venv\Scripts\python.exe -X utf8 -m compileall -q src tests
 ```
 
-已验证结果：
+当前重点测试覆盖：
 
-- DAG 生成成功
-- Orchestrator 调度成功
-- Agent tool loop 成功
-- Summarizer 生成报告成功
-- semantic memory 成功加载 `sentence-transformers/all-MiniLM-L6-v2`
+- domain profile 工具暴露
+- model factory 三层配置
+- prompt builder 输出语言和领域 prompt
+- tool-calling loop trace
+- evidence source tier
+- web search ranking
+- official doc fetcher
+- wiki store / wiki ingest gate
+- summarizer confidence
 
-## Geo MVP 运行
+## 仓库提交边界
 
-当前 GIS/遥感 MVP 使用 `configs/geo_mvp.yaml`。它会启用 GIS/遥感 Planner prompt、新的任务类型和 GIS/遥感报告结构；搜索仍可保持 mock mode，用于验证编排链路。
+新建 GitHub 仓库时，建议只提交源码、配置、测试、文档和精选展示素材。不要提交真实运行产物、密钥、虚拟环境、本地数据库和模型权重。
+
+详细清单见：[docs/repository_hygiene.md](docs/repository_hygiene.md)
+
+推荐第一次提交：
 
 ```powershell
-$env:LANGSMITH_TRACING="false"
+git add .gitignore README.md pyproject.toml requirements.txt requirements-minimal.txt `
+  .env.template .env.tools.template configs scripts src tests docs
 
-python -X utf8 scripts\run_single.py `
-  --query "如何研究 2018-2024 年武汉城市扩张对地表热环境的影响？" `
-  --config configs\geo_mvp.yaml `
-  --output_dir outputs\geo_mvp `
-  --session_id geo_mvp_m2 `
-  --log_level INFO
+git commit -m "Initial clean GeoResearch Agent portfolio version"
 ```
 
-已验证结果：
+## 面试讲法
 
-- Planner 生成 GIS/遥感 DAG
-- AgentPool 能按新 `TaskType` 路由 researcher / summarizer
-- Summarizer 输出 GIS/遥感研究报告结构
-- 报告示例：`outputs/geo_mvp/report_20260525_194006_如何研究_2018-2024_年武汉城市.md`
+可以这样概括：
 
-## 设计文档
+> 我把一个通用 DeepResearch 框架改造成了“通用深度研究 + GIS/遥感领域增强”的 Agent 系统。核心不是单次 LLM 调用，而是 Planner 把问题拆成 DAG，Orchestrator 用状态机和 asyncio 调度任务，Agent 内部封装 prompt builder、tool registry、tool-calling loop、policy binding、memory adapter 和 trace。模型层采用 providers、profiles、module_profiles 三层配置，便于不同模块使用不同模型。报告生成时会把外部搜索、论文、官方文档和 wiki 记忆统一进入 evidence store，并按证据强度标注结论可信度，最后通过 JSONL trace 和 HTML 报告展示每一步调用、usage 和证据来源。
 
-- [M2 GIS/遥感 MVP 设计草案](docs/geo_mvp_design.md)
-
-## 计划中的 GIS / 遥感工具
-
-第一批工具计划：
-
-- `dataset_registry_tool`
-  - 查询 Landsat、Sentinel、MODIS、ERA5、WorldCover 等数据源适用性。
-- `method_registry_tool`
-  - 查询 NDVI、NDBI、LST、NDWI、change detection 等方法的公式、所需波段和限制。
-- `geo_plan_validator_tool`
-  - 检查候选数据与方法是否匹配，并输出验证结果。
-- STAC 检索工具
-  - 后续接入，用于真实数据可用性验证。
-
-## Demo Query
-
-计划中的第一条 GIS / 遥感 demo：
-
-```text
-如何研究 2018-2024 年武汉城市扩张对地表热环境的影响？
-```
-
-期望系统输出：
-
-- AOI 和时间范围识别
-- Landsat / Sentinel / WorldCover 等数据源推荐
-- LST、NDVI、NDBI、城市热岛强度等方法流程
-- 数据和方法适配性检查
-- 分辨率、云量、季节一致性、验证方案等风险提示
-- Evidence-aware 最终报告
-
-## 项目状态说明
-
-当前仓库仍保留原 DeepResearch 框架中的部分模块，例如 adversarial loop、evolution、evaluation 等。这些模块暂时不是 GIS / 遥感 MVP 的核心路径，后续会按需要保留、弱化或重构。
-
-## Git 注意事项
-
-不要提交：
-
-- `.env`
-- `.venv/`
-- `.setup-logs/`
-- `data/`
-- 大模型权重和 checkpoint
-
-推荐在关键节点提交：
-
-```powershell
-git status
-git add .
-git commit -m "docs: rewrite readme for geo research agent"
-```
+这个说法能突出四个面试点：Agent 架构、并发调度、模型配置、可信输出。
