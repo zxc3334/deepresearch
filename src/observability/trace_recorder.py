@@ -10,9 +10,9 @@ from typing import Any
 class TraceRecorder:
     """Append-only JSONL event recorder.
 
-    The recorder is intentionally small and local-first. It complements optional
-    LangSmith tracing by storing project-specific evidence and compact events in
-    a reproducible file under outputs/.
+    The recorder is intentionally small and local-first. It stores
+    project-specific evidence and compact events in a reproducible file under
+    outputs/.
     """
 
     def __init__(self, path: str, run_id: str | None = None) -> None:

@@ -55,17 +55,16 @@ class OpenAICompatiblePolicy:
         top_p: float = 1.0,
         max_tokens: int = 1024,
         tools: Optional[list[dict]] = None,
+        response_format: Optional[dict] = None,
     ):
-        raw_client = OpenAI(base_url=base_url, api_key=api_key)
-        # 如果 LangSmith 追踪开启，自动包装 client 以追踪所有 LLM 调用
-        from ..utils.tracing import maybe_wrap_openai_client
-        self.client = maybe_wrap_openai_client(raw_client)
+        self.client = OpenAI(base_url=base_url, api_key=api_key)
         self.model_name = model_name
         self.base_url = base_url
         self.temperature = temperature
         self.top_p = top_p
         self.max_tokens = max_tokens
         self.tools = tools
+        self.response_format = response_format
         # [污染标记] 一旦发生过主动截断，整条 trajectory 作废
         self.was_truncated = False
 
@@ -205,6 +204,8 @@ class OpenAICompatiblePolicy:
         if self.tools:
             kwargs["tools"] = self.tools
             kwargs["tool_choice"] = "auto"
+        if self.response_format:
+            kwargs["response_format"] = self.response_format
 
         try:
             resp = self.client.chat.completions.create(**kwargs)

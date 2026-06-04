@@ -57,13 +57,6 @@ print(check("SEMANTIC_SCHOLAR_API_KEY", optional=True))
 
 print()
 print("=" * 60)
-print("LangSmith 追踪配置（可选）")
-print("=" * 60)
-print(check("LANGSMITH_TRACING", optional=True))
-print(check("LANGSMITH_API_KEY", optional=True))
-
-print()
-print("=" * 60)
 print("关键配置建议")
 print("=" * 60)
 
